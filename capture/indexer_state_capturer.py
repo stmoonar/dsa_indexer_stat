@@ -10,13 +10,41 @@ indexer_state_capturer.py — 截获 DSA indexer 的 q^I, w, k^I, topk_indices
 
 import os
 import logging
-from typing import Optional
+from typing import Optional, FrozenSet
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def parse_layer_spec(spec: str) -> Optional[FrozenSet[int]]:
+    """
+    解析层过滤表达式，返回层 id 集合；None 表示不过滤（采全部层）。
+
+    支持格式（可混用，逗号分隔）："0-4"、"0,1,2"、"0-2,60"。
+    空串 / "all" → None。
+    """
+    spec = spec.strip()
+    if not spec or spec.lower() == "all":
+        return None
+    layers = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo), int(hi)
+            if lo > hi:
+                raise ValueError(f"Invalid layer range: {part}")
+            layers.update(range(lo, hi + 1))
+        else:
+            layers.add(int(part))
+    if not layers:
+        return None
+    return frozenset(layers)
 
 
 @dataclass
@@ -26,6 +54,8 @@ class IndexerStateCapturer:
 
     用法：在 Indexer.forward_cuda 中，query/key/weights 计算完成后调用 capture()。
     生成结束后调用 save() 写磁盘。
+
+    capture_layers: 只截获这些层（None = 全部 61 层）。
     """
     output_dir: str
     num_layers: int = 61
@@ -34,6 +64,7 @@ class IndexerStateCapturer:
     top_k: int = 2048
     enabled: bool = True
     rank: int = 0
+    capture_layers: Optional[FrozenSet[int]] = None
 
     # 运行时状态
     _step_data: dict = field(default_factory=dict)  # {(step, layer): {q, w, topk}}
@@ -44,12 +75,15 @@ class IndexerStateCapturer:
     def should_capture(self) -> bool:
         return self.enabled and self.rank == 0
 
+    def should_capture_layer(self, layer_id: int) -> bool:
+        return self.capture_layers is None or layer_id in self.capture_layers
+
     def capture_prefill_k(self, layer_id: int, key: torch.Tensor):
         """
         Prefill 阶段截获 k^I。key 是 post-RoPE, post-Hadamard, bf16。
         key shape: [num_tokens, head_dim]
         """
-        if not self.should_capture():
+        if not self.should_capture() or not self.should_capture_layer(layer_id):
             return
         if layer_id not in self._k_buffers:
             self._k_buffers[layer_id] = []
@@ -60,7 +94,7 @@ class IndexerStateCapturer:
         Decode 阶段截获新 token 的 k^I。
         key shape: [1, head_dim] 或 [batch, head_dim]（bs=1 时为 [1, head_dim]）
         """
-        if not self.should_capture():
+        if not self.should_capture() or not self.should_capture_layer(layer_id):
             return
         if layer_id not in self._k_buffers:
             self._k_buffers[layer_id] = []
@@ -79,9 +113,15 @@ class IndexerStateCapturer:
         query shape: [1, H, d_I] → 存 [H, d_I]
         weights shape: [1, H] 或 [1, H, 1] → 存 [H]（raw w * n_heads^{-0.5}，不含 q_scale/softmax_scale）
         topk_indices shape: [1, top_k] → 存 [top_k]
+
+        步进：同一层在 decode 中再次出现即视为进入新 step
+        （集成方无须显式调用 advance_decode_step）。
         """
-        if not self.should_capture():
+        if not self.should_capture() or not self.should_capture_layer(layer_id):
             return
+
+        if (self._current_decode_step, layer_id) in self._step_data:
+            self._current_decode_step += 1
 
         step = self._current_decode_step
 
@@ -152,24 +192,62 @@ class IndexerStateCapturer:
 
         logger.info(f"  Saved {n_steps} step-layer dumps")
 
-        # 保存 config
+        # 保存 config（约束 13：run 输出目录必须含配置快照）
+        import json
+        merged = {
+            "num_layers": self.num_layers,
+            "capture_layers": (
+                sorted(self.capture_layers) if self.capture_layers else "all"
+            ),
+            "num_decode_steps": self.num_decode_steps,
+            "rank_id": self.rank,
+        }
         if config_dict:
-            import json
-            config_path = os.path.join(self.output_dir, "capture_config.json")
-            with open(config_path, "w") as f:
-                json.dump(config_dict, f, indent=2)
+            merged.update(config_dict)
+        config_path = os.path.join(self.output_dir, "capture_config.json")
+        with open(config_path, "w") as f:
+            json.dump(merged, f, indent=2)
 
         logger.info("Indexer state save complete")
 
     @property
     def num_decode_steps(self) -> int:
-        return self._current_decode_step
+        if not self._step_data:
+            return 0
+        return max(s for (s, _) in self._step_data) + 1
 
 
 _global_capturer: Optional[IndexerStateCapturer] = None
+_env_init_attempted: bool = False
 
 
 def get_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
+    """
+    获取全局 capturer。
+
+    若尚未初始化且设置了 DSA_CAPTURE_OUTPUT_DIR，则从环境变量惰性初始化——
+    这使得 patch 进 SGLang 的 dsa_indexer.py 无须任何显式 init 调用，
+    每个 TP worker 进程在首次 forward 时自动建立 capturer（约束 10）。
+
+    环境变量：
+      DSA_CAPTURE_OUTPUT_DIR  dump 输出目录（未设置 → 不 capture）
+      DSA_CAPTURE_LAYERS      层过滤，如 "0-4"（默认全部层）
+      DSA_CAPTURE_NUM_LAYERS  模型层数（默认 61）
+    """
+    global _env_init_attempted
+    if _global_capturer is None and not _env_init_attempted:
+        _env_init_attempted = True
+        output_dir = os.environ.get("DSA_CAPTURE_OUTPUT_DIR", "").strip()
+        if output_dir:
+            init_indexer_state_capturer(
+                output_dir=output_dir,
+                num_layers=int(os.environ.get("DSA_CAPTURE_NUM_LAYERS", "61")),
+                rank=_detect_rank(),
+                enabled=True,
+                capture_layers=parse_layer_spec(
+                    os.environ.get("DSA_CAPTURE_LAYERS", "")
+                ),
+            )
     return _global_capturer
 
 
@@ -178,17 +256,34 @@ def set_indexer_state_capturer(capturer: Optional[IndexerStateCapturer]):
     _global_capturer = capturer
 
 
+def _detect_rank() -> int:
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return int(os.environ.get("RANK", "0"))
+
+
 def init_indexer_state_capturer(
     output_dir: str,
     num_layers: int = 61,
     rank: int = 0,
     enabled: bool = True,
+    capture_layers: Optional[FrozenSet[int]] = None,
 ) -> IndexerStateCapturer:
     capturer = IndexerStateCapturer(
         output_dir=output_dir,
         num_layers=num_layers,
         rank=rank,
         enabled=enabled,
+        capture_layers=capture_layers,
     )
     set_indexer_state_capturer(capturer)
+
+    # worker 进程正常退出时自动落盘（server 被 SIGTERM 优雅关闭即触发）
+    if capturer.should_capture():
+        import atexit
+        atexit.register(capturer.save)
     return capturer

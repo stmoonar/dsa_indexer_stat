@@ -61,6 +61,17 @@ long_cot:
       min_new_tokens: 512
       context_length: 32768
 
+# 族 5: Agentic traces — lmcache-agentic-traces 数据集
+# 数据源: /data/datasets/lmcache-agentic-traces/data/*.parquet
+# prompt 由 capture/prepare_prompt.py 生成（挑选贴近 budget 的单条 trace）
+agentic_trace:
+  description: "真实 agentic 推理 trace，工具调用/多轮混合上下文"
+  sequences:
+    - name: "agentic_32k"
+      prompt_file: "prompts/agentic_32k.txt"
+      min_new_tokens: 256
+      context_length: 32768
+
 # Smoke 配置（2K × 10 step，打通全链路）
 smoke:
   description: "冒烟测试，验证 capture → replay → kernel 对齐"

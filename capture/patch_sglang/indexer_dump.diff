@@ -6,7 +6,10 @@ index abcdef..123456 100644
  # ... (imports section, add at end of imports)
 
  from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
-+from indexer_state_capturer import get_indexer_state_capturer  # DSA-STAT PATCH
++# DSA-STAT PATCH: 需要 PYTHONPATH 含 dsa_indexer_stat 仓库根目录。
++# capturer 由 DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS 环境变量在
++# worker 进程内惰性初始化，无须显式 init 调用。
++from capture.indexer_state_capturer import get_indexer_state_capturer  # DSA-STAT PATCH
 
  # ... (in Indexer.forward_cuda, after query/key are computed and BEFORE FP8 quantization)
 

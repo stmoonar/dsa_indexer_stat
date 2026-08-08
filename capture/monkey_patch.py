@@ -21,7 +21,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def patch_indexer(output_dir: str, num_layers: int = 61):
+def patch_indexer(output_dir: str, num_layers: int = 61,
+                  capture_layers: Optional[str] = None):
     """
     Monkey-patch SGLang 的 Indexer，截获 decode 阶段的 q^I, w, k^I, topk_indices。
 
@@ -29,17 +30,25 @@ def patch_indexer(output_dir: str, num_layers: int = 61):
 
     约束 7: 需搭配 --disable-cuda-graph 使用。
     约束 8: 不解析 paged KV pool，直接在 forward 内截获 pre-quantization 的 key。
+
+    capture_layers: 层过滤表达式（如 "0-4" 只采前 5 层）；
+                    None 时读环境变量 DSA_CAPTURE_LAYERS，均未设置则采全部层。
     """
     from capture.indexer_state_capturer import (
         IndexerStateCapturer,
         set_indexer_state_capturer,
+        parse_layer_spec,
     )
+
+    if capture_layers is None:
+        capture_layers = os.environ.get("DSA_CAPTURE_LAYERS", "")
 
     capturer = IndexerStateCapturer(
         output_dir=output_dir,
         num_layers=num_layers,
         rank=_get_rank(),
         enabled=True,
+        capture_layers=parse_layer_spec(capture_layers),
     )
     set_indexer_state_capturer(capturer)
 
@@ -50,8 +59,9 @@ def patch_indexer(output_dir: str, num_layers: int = 61):
     @functools.wraps(original_forward)
     def patched_forward(self, x, q_lora, positions, forward_batch, layer_id,
                         return_indices=True):
-        # 仅在需要 capture 且不在 CUDA graph 中时截获
-        if not capturer.should_capture():
+        # 仅在需要 capture 且不在 CUDA graph 中时截获；
+        # 层被过滤时直接走原始 forward，避免额外的 q/k/w 重复计算
+        if not capturer.should_capture() or not capturer.should_capture_layer(layer_id):
             return original_forward(
                 self, x, q_lora, positions, forward_batch, layer_id, return_indices
             )
