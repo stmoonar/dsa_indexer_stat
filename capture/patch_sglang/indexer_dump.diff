@@ -1,0 +1,66 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+index abcdef..123456 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+@@ -1,6 +1,7 @@
+ # ... (imports section, add at end of imports)
+
+ from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
++from indexer_state_capturer import get_indexer_state_capturer  # DSA-STAT PATCH
+
+ # ... (in Indexer.forward_cuda, after query/key are computed and BEFORE FP8 quantization)
+
+@@ -1385,6 +1386,20 @@
+         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+             current_stream = torch.cuda.current_stream()
+             self.alt_stream.wait_stream(current_stream)
+             weights = self._project_and_scale_head_gates(x)
+             query, key = self._get_q_k_bf16(
+                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+             )
++            # === DSA-STAT PATCH: capture pre-quantization tensors ===
++            _cap = get_indexer_state_capturer()
++            if _cap is not None and _cap.should_capture():
++                if forward_batch.forward_mode.is_decode_or_idle():
++                    _cap.capture_decode_k(layer_id, key)
++                    _cap.capture_decode_step(
++                        layer_id=layer_id,
++                        query=query,
++                        weights=weights,  # raw w * n_heads^{-0.5}, before q_scale/softmax_scale
++                        topk_indices=torch.zeros(1, self.index_topk, dtype=torch.int32, device=query.device),
++                        # topk_indices placeholder; real ones captured after scoring
++                    )
++            # === END DSA-STAT PATCH ===
+             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+
+ # IMPORTANT: The above shows the insertion point for the dual-stream decode path.
+@@ -1402,6 +1417,17 @@
+         else:
+             query, key = self._get_q_k_bf16(
+                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+             )
++            # === DSA-STAT PATCH: capture for non-dual-stream path ===
++            _cap = get_indexer_state_capturer()
++            if _cap is not None and _cap.should_capture():
++                if forward_batch.forward_mode.is_decode_or_idle():
++                    _cap.capture_decode_k(layer_id, key)
++                else:
++                    _cap.capture_prefill_k(layer_id, key)
++            # === END DSA-STAT PATCH ===
+
+ # ... (after topk_result is computed, before return, capture the real topk)
+
+@@ -1510,6 +1536,15 @@
+                 topk_result = self._get_topk_paged(
+                     forward_batch, layer_id, q_fp8, weights, metadata
+                 )
++                # === DSA-STAT PATCH: capture real topk + q/w for decode ===
++                _cap = get_indexer_state_capturer()
++                if _cap is not None and _cap.should_capture():
++                    _cap.capture_decode_step(
++                        layer_id=layer_id,
++                        query=query,
++                        weights=weights_raw,  # see note below
++                        topk_indices=topk_result,
++                    )
++                # === END DSA-STAT PATCH ===

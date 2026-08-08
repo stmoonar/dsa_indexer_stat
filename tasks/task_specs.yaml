@@ -1,0 +1,71 @@
+# 任务族定义：4 族 × 每族 3-5 条序列
+# 每族的选择理由见 docs/measurements.md
+
+# 族 1: RULER/NIAH — 块集中，有利于剪枝
+ruler_niah:
+  description: "Needle-in-a-Haystack 及 RULER 检索类任务，top-k 集中在少数块"
+  sequences:
+    - name: "niah_single_128k"
+      prompt_file: "prompts/niah_single_128k.txt"
+      min_new_tokens: 64
+      context_length: 131072
+    - name: "niah_single_32k"
+      prompt_file: "prompts/niah_single_32k.txt"
+      min_new_tokens: 64
+      context_length: 32768
+    - name: "ruler_multi_key_128k"
+      prompt_file: "prompts/ruler_multi_key_128k.txt"
+      min_new_tokens: 128
+      context_length: 131072
+
+# 族 2: 长文摘要/聚合 — 弥散，对抗项（必须有）
+summarization:
+  description: "长文摘要或信息聚合，top-k 弥散分布在全序列"
+  sequences:
+    - name: "long_doc_summary_128k"
+      prompt_file: "prompts/long_doc_summary_128k.txt"
+      min_new_tokens: 512
+      context_length: 131072
+    - name: "long_doc_summary_32k"
+      prompt_file: "prompts/long_doc_summary_32k.txt"
+      min_new_tokens: 256
+      context_length: 32768
+    - name: "multi_doc_qa_128k"
+      prompt_file: "prompts/multi_doc_qa_128k.txt"
+      min_new_tokens: 256
+      context_length: 131072
+
+# 族 3: Repo 级代码续写
+code_completion:
+  description: "仓库级代码续写，中等块局部性"
+  sequences:
+    - name: "repo_code_128k"
+      prompt_file: "prompts/repo_code_128k.txt"
+      min_new_tokens: 256
+      context_length: 131072
+    - name: "repo_code_32k"
+      prompt_file: "prompts/repo_code_32k.txt"
+      min_new_tokens: 256
+      context_length: 32768
+
+# 族 4: 长 CoT — 自生成上下文，decode 阶段块在线形成
+long_cot:
+  description: "长链式思考，decode 过程中上下文持续增长"
+  sequences:
+    - name: "math_cot_128k"
+      prompt_file: "prompts/math_cot_128k.txt"
+      min_new_tokens: 1024
+      context_length: 131072
+    - name: "code_debug_cot_32k"
+      prompt_file: "prompts/code_debug_cot_32k.txt"
+      min_new_tokens: 512
+      context_length: 32768
+
+# Smoke 配置（2K × 10 step，打通全链路）
+smoke:
+  description: "冒烟测试，验证 capture → replay → kernel 对齐"
+  sequences:
+    - name: "smoke_short"
+      prompt_file: "prompts/smoke_short.txt"
+      min_new_tokens: 10
+      context_length: 2048
