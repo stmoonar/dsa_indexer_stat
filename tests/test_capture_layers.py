@@ -209,17 +209,26 @@ class TestVllmPerfDefaults:
         from capture.vllm_generate import resolve_perf_defaults
         chunk, util = resolve_perf_defaults(True)
         assert chunk is None and util == 0.85
+        chunk, util = resolve_perf_defaults(True, truncated=True)
+        assert chunk is None and util == 0.5
 
-    def test_without_deep_gemm_fits_memory(self):
+    @pytest.mark.parametrize("truncated", [False, True])
+    def test_without_deep_gemm_fits_memory(self, truncated):
         """兜底配置的 einsum 峰值 + torch 预算必须 < 79GB (H800)。"""
         from capture.vllm_generate import resolve_perf_defaults
-        chunk, util = resolve_perf_defaults(False)
+        chunk, util = resolve_perf_defaults(False, truncated=truncated)
         ctx, heads = 33792, 64
         einsum_gb = heads * chunk * ctx * 4 / 1e9
         torch_budget_gb = util * 79.1
         assert einsum_gb + torch_budget_gb < 75, (
             f"fallback config OOMs: einsum={einsum_gb:.1f}GB "
             f"+ budget={torch_budget_gb:.1f}GB")
+
+    def test_truncated_budget_covers_weights_and_kv(self):
+        """截断预算 0.45×79≈35.6GB 需容纳每卡权重 ~5GB + KV/激活。"""
+        from capture.vllm_generate import resolve_perf_defaults
+        _, util = resolve_perf_defaults(False, truncated=True)
+        assert util * 79.1 > 5 + 10  # 权重 + 充裕的 KV/激活余量
 
 
 class TestPreparePrompt:

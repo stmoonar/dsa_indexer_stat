@@ -32,16 +32,20 @@ def deep_gemm_available() -> bool:
     return importlib.util.find_spec("deep_gemm") is not None
 
 
-def resolve_perf_defaults(has_deep_gemm: bool):
+def resolve_perf_defaults(has_deep_gemm: bool, truncated: bool = False):
     """返回 (max_num_batched_tokens, gpu_memory_utilization)。
 
     无 DeepGEMM 时 indexer 走 fp8_mqa_logits_torch 兜底，prefill 会物化
     [H=64, chunk, ctx] 的 fp32 logits：chunk=16384、ctx=32K 时 ≈ 62GB → OOM。
-    兜底配置 chunk=2048 → ≈ 17.5GB，同时把 util 降到 0.65 留出 free 显存。
+    兜底配置 chunk=2048 → ≈ 17.5GB，并压低 util 留出 free 显存。
+
+    截断模型（前 5 层）权重每卡仅 ~5GB，KV 需求 ~100MB 量级，而 vLLM 会把
+    util 预算内的剩余显存全部划给 KV 池——截断时预算再压一档，纯属浪费的
+    KV 池让位给兜底 einsum 的 free 显存。
     """
     if has_deep_gemm:
-        return None, 0.85          # None = 用 vLLM 默认 chunk
-    return 2048, 0.65
+        return None, (0.5 if truncated else 0.85)   # None = vLLM 默认 chunk
+    return 2048, (0.45 if truncated else 0.65)
 
 
 def main():
@@ -60,7 +64,8 @@ def main():
     args = ap.parse_args()
 
     has_dg = deep_gemm_available()
-    auto_chunk, auto_util = resolve_perf_defaults(has_dg)
+    auto_chunk, auto_util = resolve_perf_defaults(
+        has_dg, truncated=args.num_layers > 0)
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = auto_chunk
     if args.gpu_memory_utilization is None:
