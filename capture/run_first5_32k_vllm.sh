@@ -90,6 +90,12 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 MAX_MODEL_LEN=$(( CONTEXT_LENGTH + MAX_NEW_TOKENS + 512 ))
 
+# 无 DeepGEMM 时 vllm_generate 会自动降级 chunk/显存配置；
+# 需要手动覆盖时设 MAX_BATCHED_TOKENS / GPU_MEM_UTIL
+EXTRA_ARGS=()
+[[ -n "${MAX_BATCHED_TOKENS:-}" ]] && EXTRA_ARGS+=(--max-num-batched-tokens "${MAX_BATCHED_TOKENS}")
+[[ -n "${GPU_MEM_UTIL:-}" ]] && EXTRA_ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
+
 python -m capture.vllm_generate \
     --model "${MODEL_PATH}" \
     --prompt-file "${PROMPT_FILE}" \
@@ -97,6 +103,7 @@ python -m capture.vllm_generate \
     --num-layers "${NUM_LAYERS}" \
     --tp "${TP}" \
     --max-model-len "${MAX_MODEL_LEN}" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     2>&1 | tee "${LOG_FILE}"
 
 sleep 5   # 等 worker 退出并完成最终落盘

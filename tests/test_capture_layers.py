@@ -203,6 +203,25 @@ class TestSaveEvery:
             set_indexer_state_capturer(None)
 
 
+class TestVllmPerfDefaults:
+
+    def test_with_deep_gemm(self):
+        from capture.vllm_generate import resolve_perf_defaults
+        chunk, util = resolve_perf_defaults(True)
+        assert chunk is None and util == 0.85
+
+    def test_without_deep_gemm_fits_memory(self):
+        """兜底配置的 einsum 峰值 + torch 预算必须 < 79GB (H800)。"""
+        from capture.vllm_generate import resolve_perf_defaults
+        chunk, util = resolve_perf_defaults(False)
+        ctx, heads = 33792, 64
+        einsum_gb = heads * chunk * ctx * 4 / 1e9
+        torch_budget_gb = util * 79.1
+        assert einsum_gb + torch_budget_gb < 75, (
+            f"fallback config OOMs: einsum={einsum_gb:.1f}GB "
+            f"+ budget={torch_budget_gb:.1f}GB")
+
+
 class TestPreparePrompt:
 
     def test_row_to_text_plain_string(self):
