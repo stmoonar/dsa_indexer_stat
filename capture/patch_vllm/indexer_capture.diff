@@ -7,7 +7,7 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
  
 +# === DSA-STAT PATCH: indexer state capture ===
 +# 需要 dsa_indexer_stat 仓库根目录在 PYTHONPATH 上；capturer 由
-+# DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS / DSA_CAPTURE_PREFILL_TAIL 等
++# DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS / DSA_CAPTURE_PREFILL_* 等
 +# 环境变量在 worker 进程内惰性初始化（见 capture/indexer_state_capturer.py）。
 +# 未设置 DSA_CAPTURE_OUTPUT_DIR 时零开销。
 +try:
@@ -37,7 +37,7 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 +    topk_buffer: indexer op 返回的 topk_indices_buffer（全量 buffer，逐层复用）
 +
 +    decode 段与 prefill 段分别落到 step / prefill 两套 dump。
-+    prefill 的 q/w 只按 capturer 的采样策略抓少量位置（滚动尾窗 + stride）。
++    prefill 的 q/w 只按 capturer 的采样策略抓少量位置（尾窗 + bucket 连续段）。
 +    """
 +    cap = get_indexer_state_capturer()
 +    if cap is None or not cap.should_capture():
@@ -137,3 +137,38 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
              is_fusion_moe_shared_experts_layer = (
                  rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
              )
+
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -164,6 +164,30 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+                 hidden_states, q_c, positions, self.indexer_rope_emb
+             )
+ 
++            # === DSA-STAT PATCH: dump MLA KV latent (想法 2 的裁决数据) ===
++            # kv_c_normed [T,512] + k_pe [T,1,64] 就是 paged KV cache 里
++            # 每 token 存的条目；要回答的是 k^I(128) 能否由它线性重建。
++            # 这两个张量只在 MLA forward 里可见，indexer 拿不到，故在此 hook。
++            # 仅当 DSA_CAPTURE_LATENT=1 时开销非零。
++            try:
++                from capture.indexer_state_capturer import (
++                    get_indexer_state_capturer as _dsa_get_cap,
++                )
++            except ImportError:
++                _dsa_get_cap = None
++            if _dsa_get_cap is not None:
++                _dsa_cap = _dsa_get_cap()
++                if _dsa_cap is not None and _dsa_cap.capture_latent:
++                    try:
++                        _dsa_lid = int(
++                            self.indexer.prefix.split("layers.")[1].split(".")[0]
++                        )
++                    except (IndexError, ValueError):
++                        _dsa_lid = -1
++                    if _dsa_lid >= 0:
++                        _dsa_cap.capture_mla_latent(_dsa_lid, kv_c_normed, k_pe)
++            # === END DSA-STAT PATCH ===
++
+         if llama_4_scaling is not None:
+             q *= llama_4_scaling
+ 

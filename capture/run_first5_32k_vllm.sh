@@ -87,12 +87,19 @@ export DSA_CAPTURE_LAYERS="${CAPTURE_LAYERS}"
 export DSA_CAPTURE_NUM_LAYERS="${NUM_LAYERS}"
 export DSA_CAPTURE_SAVE_EVERY="${DSA_CAPTURE_SAVE_EVERY:-64}"
 # prefill 期真实 query 采样：
-#   TAIL   = 保留最后 N 个 prefill 位置（连续，可算 warm 集 / churn）
-#   STRIDE = 额外每 N 个位置抓一个（上下文长度扫描；0 = 关）
+#   TAIL    = 保留最后 N 个 prefill 位置（连续）
+#   BUCKETS = 位置锚点，每个锚点抓 RUN 个【连续】位置
+#   RUN     = 每个锚点的连续段长度
+# 必须是连续段：warm 集 / τ / churn 都要求"同层前一个采样位置"，
+# 孤立位置在配对时会被丢弃，前缀长度曲线会静默塌缩成单点。
+# 分桶后免费多出一个维度：oracle 可剪率 / 覆盖率 / 块触及数 随前缀长度的曲线。
 # 截断模型下 layer 0-4 的 prefill q/k/w 与全模型逐位一致，
 # 因此这批数据不受"decode 轨迹是乱码"的污染。
-export DSA_CAPTURE_PREFILL_TAIL="${PREFILL_TAIL:-64}"
-export DSA_CAPTURE_PREFILL_STRIDE="${PREFILL_STRIDE:-4096}"
+export DSA_CAPTURE_PREFILL_TAIL="${PREFILL_TAIL:-32}"
+export DSA_CAPTURE_PREFILL_BUCKETS="${PREFILL_BUCKETS:-2048,8192,16384,24576,31744}"
+export DSA_CAPTURE_PREFILL_RUN="${PREFILL_RUN:-32}"
+# MLA latent（想法 2：k^I 能否由已存的 c_s 线性重建）；约 +190MB/5 层
+export DSA_CAPTURE_LATENT="${CAPTURE_LATENT:-1}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 MAX_MODEL_LEN=$(( CONTEXT_LENGTH + MAX_NEW_TOKENS + 512 ))
@@ -123,8 +130,10 @@ N_STEP=$(ls "${OUTPUT_DIR}"/step*_layer*.npz 2>/dev/null | wc -l)
 N_PREFILL=$(ls "${OUTPUT_DIR}"/prefill_pos*_layer*.npz 2>/dev/null | wc -l)
 echo "k_I buffers:      ${N_K} (expect ${NUM_LAYERS})"
 echo "step-layer dumps: ${N_STEP} (expect ~$(( MAX_NEW_TOKENS * NUM_LAYERS )))"
-echo "prefill dumps:    ${N_PREFILL} (真实 query，tail=${DSA_CAPTURE_PREFILL_TAIL} "\
-"stride=${DSA_CAPTURE_PREFILL_STRIDE})"
+N_LATENT=$(ls "${OUTPUT_DIR}"/c_latent_layer*.npy 2>/dev/null | wc -l)
+echo "prefill dumps:    ${N_PREFILL} (真实 query; tail=${DSA_CAPTURE_PREFILL_TAIL} "\
+"buckets=${DSA_CAPTURE_PREFILL_BUCKETS} run=${DSA_CAPTURE_PREFILL_RUN})"
+echo "MLA latent:       ${N_LATENT} (想法 2 的 c_s)"
 
 GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 VLLM_HASH=$(git -C "${VLLM_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -142,7 +151,9 @@ cat > "${OUTPUT_DIR}/run_meta.json" <<EOF
   "max_new_tokens": ${MAX_NEW_TOKENS},
   "capture_layers": "${CAPTURE_LAYERS}",
   "prefill_tail": ${DSA_CAPTURE_PREFILL_TAIL},
-  "prefill_stride": ${DSA_CAPTURE_PREFILL_STRIDE},
+  "prefill_buckets": "${DSA_CAPTURE_PREFILL_BUCKETS}",
+  "prefill_run": ${DSA_CAPTURE_PREFILL_RUN},
+  "capture_latent": ${DSA_CAPTURE_LATENT},
   "tp": ${TP},
   "max_model_len": ${MAX_MODEL_LEN},
   "timestamp": "${TIMESTAMP}"

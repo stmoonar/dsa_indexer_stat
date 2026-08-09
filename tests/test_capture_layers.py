@@ -207,9 +207,10 @@ class TestPrefillCapture:
     """prefill q/w 采样：滚动尾窗 + stride，chunked prefill 下必须收敛到
     全局最后 tail 个位置（这批数据的 query 是真实的，见 patch 注释）。"""
 
-    def make(self, tmp_path, tail=0, stride=0):
+    def make(self, tmp_path, tail=0, buckets=(), run=32):
         cap = make_capturer(tmp_path, layers=frozenset({0}))
-        cap.prefill_tail, cap.prefill_stride = tail, stride
+        cap.prefill_tail = tail
+        cap.prefill_buckets, cap.prefill_run = buckets, run
         return cap
 
     def feed_chunk(self, cap, positions, layer=0):
@@ -257,13 +258,41 @@ class TestPrefillCapture:
         assert got == list(range(184, 200))
         assert all(b - a == 1 for a, b in zip(got, got[1:]))
 
-    def test_stride_kept_across_trim(self, tmp_path):
-        cap = self.make(tmp_path, tail=4, stride=50)
+    def test_buckets_are_contiguous_runs(self, tmp_path):
+        """桶必须是连续段——孤立位置在 warm 集配对时会被整段丢弃。"""
+        cap = self.make(tmp_path, tail=4, buckets=(50, 120), run=6)
         for start in range(0, 200, 40):
             self.feed_chunk(cap, list(range(start, start + 40)))
-        got = self.captured(cap)
-        assert {0, 50, 100, 150} <= set(got), got     # stride 命中不被裁掉
-        assert set(range(196, 200)) <= set(got), got  # 尾窗保留
+        got = set(self.captured(cap))
+        assert set(range(50, 56)) <= got                  # 桶 1 完整连续
+        assert set(range(120, 126)) <= got                # 桶 2 完整连续
+        assert set(range(196, 200)) <= got                # 尾窗保留
+
+    def test_bucket_survives_trim(self, tmp_path):
+        """桶位置远早于尾窗，滚动裁剪不得把它删掉。"""
+        cap = self.make(tmp_path, tail=2, buckets=(10,), run=4)
+        for start in range(0, 400, 50):
+            self.feed_chunk(cap, list(range(start, start + 50)))
+        assert set(range(10, 14)) <= set(self.captured(cap))
+
+    def test_bucket_spanning_chunk_boundary(self, tmp_path):
+        """桶跨 chunk 边界时两半都要抓到（按绝对位置选，非 chunk 内偏移）。"""
+        cap = self.make(tmp_path, tail=0, buckets=(38,), run=8)
+        self.feed_chunk(cap, list(range(0, 40)))    # 覆盖 38,39
+        self.feed_chunk(cap, list(range(40, 80)))   # 覆盖 40..45
+        assert self.captured(cap) == list(range(38, 46))
+
+    def test_pairs_survive_run_measurements_filter(self, tmp_path):
+        """端到端：桶采样出的位置必须能形成相邻对，否则 m3/m4 无数据。"""
+        from analysis.run_measurements import collect_samples
+        cap = self.make(tmp_path, tail=0, buckets=(100, 200), run=5)
+        for start in range(0, 300, 50):
+            self.feed_chunk(cap, list(range(start, start + 50)))
+        cap.save()
+        samples = collect_samples(str(tmp_path), 0, "prefill", n_prompt=0)
+        pairs = [(a, b) for a, b in zip(samples, samples[1:])
+                 if b[0] == a[0] + 1]
+        assert len(pairs) == 8, [c for c, _ in samples]  # 每桶 5 个 -> 4 对
 
     def test_saved_files_and_config(self, tmp_path):
         cap = self.make(tmp_path, tail=4)
@@ -274,6 +303,30 @@ class TestPrefillCapture:
         cfg = json.load(open(tmp_path / "capture_config.json"))
         assert cfg["prefill_tail"] == 4
         assert cfg["prefill_positions"] == [16, 17, 18, 19]
+
+    def test_latent_capture(self, tmp_path):
+        """MLA latent（想法 2）：按 token 追加，存 fp16。"""
+        cap = self.make(tmp_path)
+        cap.capture_latent = True
+        for n in (30, 20):
+            cap.capture_mla_latent(0, torch.randn(n, 512),
+                                   torch.randn(n, 1, 64))
+        cap.save()
+        c = np.load(tmp_path / "c_latent_layer000.npy")
+        kpe = np.load(tmp_path / "k_pe_layer000.npy")
+        assert c.shape == (50, 512) and c.dtype == np.float16
+        assert kpe.shape == (50, 64) and kpe.dtype == np.float16
+
+    def test_latent_off_by_default(self, tmp_path):
+        cap = self.make(tmp_path)
+        cap.capture_mla_latent(0, torch.randn(4, 512), torch.randn(4, 1, 64))
+        assert cap._c_buffers == {}
+
+    def test_latent_respects_layer_filter(self, tmp_path):
+        cap = self.make(tmp_path)          # capture_layers = {0}
+        cap.capture_latent = True
+        cap.capture_mla_latent(3, torch.randn(4, 512), torch.randn(4, 1, 64))
+        assert cap._c_buffers == {}
 
     def test_roundtrip_through_loader(self, tmp_path):
         from replay.loader import (list_prefill_positions, load_prefill_dump,
@@ -297,10 +350,14 @@ class TestPrefillCapture:
         set_indexer_state_capturer(None)
         isc._env_init_attempted = False
         monkeypatch.setenv("DSA_CAPTURE_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("DSA_CAPTURE_PREFILL_TAIL", "64")
-        monkeypatch.setenv("DSA_CAPTURE_PREFILL_STRIDE", "4096")
+        monkeypatch.setenv("DSA_CAPTURE_PREFILL_TAIL", "32")
+        monkeypatch.setenv("DSA_CAPTURE_PREFILL_BUCKETS", "2048,8192,16384")
+        monkeypatch.setenv("DSA_CAPTURE_PREFILL_RUN", "32")
+        monkeypatch.setenv("DSA_CAPTURE_LATENT", "1")
         cap = get_indexer_state_capturer()
-        assert (cap.prefill_tail, cap.prefill_stride) == (64, 4096)
+        assert cap.prefill_tail == 32
+        assert cap.prefill_buckets == (2048, 8192, 16384)
+        assert cap.prefill_run == 32 and cap.capture_latent
         assert cap.capture_prefill_qw
         set_indexer_state_capturer(None)
         isc._env_init_attempted = False

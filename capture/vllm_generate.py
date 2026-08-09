@@ -19,8 +19,12 @@ capture/patch_vllm/indexer_capture.diff 中的 load_weights 跳层逻辑。
 """
 
 import os
+import json
+import hashlib
 import argparse
 import importlib.util
+
+import numpy as np
 
 
 def deep_gemm_available() -> bool:
@@ -115,6 +119,23 @@ def main():
     print(f"\n=== Generation done: prompt_tokens={n_prompt}, "
           f"completion_tokens={n_gen} ===")
     print(f"--- first 500 chars of output ---\n{out.outputs[0].text[:500]}")
+
+    # 落盘实际喂给模型的 token ids：全模型 run 的金丝雀测试要求输入完全一致，
+    # 光靠 prompt 文本不够（tokenizer 版本/模板变化会静默改变 token 流）
+    out_dir = os.environ.get("DSA_CAPTURE_OUTPUT_DIR", "").strip()
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        ids = np.asarray(out.prompt_token_ids, dtype=np.int32)
+        np.save(os.path.join(out_dir, "prompt_token_ids.npy"), ids)
+        with open(os.path.join(out_dir, "prompt_fingerprint.json"), "w") as f:
+            json.dump({
+                "n_prompt_tokens": int(n_prompt),
+                "n_completion_tokens": int(n_gen),
+                "token_ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+                "prompt_file": args.prompt_file,
+                "model": args.model,
+            }, f, indent=2)
+        print(f"Wrote prompt fingerprint to {out_dir}")
 
     # 显式销毁 → worker 优雅退出 → capturer atexit/SIGTERM 落盘
     del llm

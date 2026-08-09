@@ -18,6 +18,8 @@ PATCH_FILE = os.path.join(
     REPO_ROOT, "capture", "patch_vllm", "indexer_capture.diff")
 VLLM_DIR = os.path.join(REPO_ROOT, "tmp", "vllm")
 TARGET = "vllm/model_executor/models/deepseek_v2.py"
+# 想法 2 的 c_s 只在 MLA forward 里可见（indexer 拿不到），故第二个 hook 点
+TARGET_MLA = "vllm/model_executor/layers/mla.py"
 
 
 def read_patch() -> str:
@@ -27,17 +29,18 @@ def read_patch() -> str:
 
 class TestPatchStructure:
 
-    def test_single_target_file(self):
+    def test_target_files(self):
+        """侵入面必须只有这两个模型/层文件——不得扩到调度器或内存池（约束 10）。"""
         patch = read_patch()
         targets = re.findall(r"^\+\+\+ b/(.+)$", patch, re.MULTILINE)
-        assert targets == [TARGET]
+        assert targets == [TARGET, TARGET_MLA]
 
     def test_markers_balanced(self):
         patch = read_patch()
         added = [ln for ln in patch.splitlines() if ln.startswith("+")]
         begin = sum("=== DSA-STAT PATCH" in ln for ln in added)
         end = sum("=== END DSA-STAT PATCH" in ln for ln in added)
-        assert begin == end == 4
+        assert begin == end == 5
 
     def test_no_crlf(self):
         with open(PATCH_FILE, "rb") as f:
@@ -50,6 +53,8 @@ class TestPatchStructure:
         assert "num_hidden_layers" in patch      # 截断跳层逻辑
         assert "capture_prefill_step" in patch   # prefill 真实 query 采样
         assert "prefill_local_mask" in patch
+        assert "capture_mla_latent" in patch     # 想法 2 的 c_s
+        assert "kv_c_normed, k_pe" in patch
 
 
 def extract_helper_source() -> str:
@@ -190,25 +195,21 @@ class TestPatchHelperBehavior:
 class TestPatchAppliesToBaseline:
 
     def test_apply_and_compile(self, tmp_path):
-        blob = subprocess.run(
-            ["git", "-C", VLLM_DIR, "show", f"HEAD:{TARGET}"],
-            capture_output=True, check=True,
-        ).stdout
+        for target in (TARGET, TARGET_MLA):
+            blob = subprocess.run(
+                ["git", "-C", VLLM_DIR, "show", f"HEAD:{target}"],
+                capture_output=True, check=True,
+            ).stdout
+            p = tmp_path / target
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(blob)
 
-        target_path = tmp_path / TARGET
-        target_path.parent.mkdir(parents=True)
-        target_path.write_bytes(blob)
+        subprocess.run(["git", "apply", "--check", PATCH_FILE],
+                       cwd=tmp_path, check=True)
+        subprocess.run(["git", "apply", PATCH_FILE],
+                       cwd=tmp_path, check=True)
 
-        subprocess.run(
-            ["git", "apply", "--check", PATCH_FILE],
-            cwd=tmp_path, check=True,
-        )
-        subprocess.run(
-            ["git", "apply", PATCH_FILE],
-            cwd=tmp_path, check=True,
-        )
-
-        patched = target_path.read_text(encoding="utf-8")
-        assert patched.count("DSA-STAT PATCH") == 8
-
-        compile(patched, str(target_path), "exec")  # SyntaxError → fail
+        for target, n_markers in ((TARGET, 8), (TARGET_MLA, 2)):
+            patched = (tmp_path / target).read_text(encoding="utf-8")
+            assert patched.count("DSA-STAT PATCH") == n_markers, target
+            compile(patched, target, "exec")   # SyntaxError → fail

@@ -47,6 +47,11 @@ def parse_layer_spec(spec: str) -> Optional[FrozenSet[int]]:
     return frozenset(layers)
 
 
+def parse_int_list(spec: str) -> tuple:
+    """解析逗号分隔的整数列表，如 "2048,8192,16384"；空串 → ()。"""
+    return tuple(int(x) for x in spec.replace(" ", "").split(",") if x)
+
+
 @dataclass
 class IndexerStateCapturer:
     """
@@ -67,17 +72,28 @@ class IndexerStateCapturer:
     capture_layers: Optional[FrozenSet[int]] = None
     save_every: int = 0  # 每 N 个 decode step 落盘一次（0 = 只在结束时落盘）
 
-    # prefill 期的 q/w 采样（0 = 不采）
-    # prefill_tail: 保留最后 N 个 prefill 位置（滚动窗口，连续，
-    #   等价于"真实 query 版的 decode step"，可算 warm 集 / churn）
-    # prefill_stride: 额外保留 pos % stride == 0 的位置（上下文长度扫描用）
+    # prefill 期的 q/w 采样（全 0 = 不采）
+    # prefill_tail:    保留最后 N 个 prefill 位置（滚动窗口）
+    # prefill_buckets: 位置锚点列表，每个锚点抓 [anchor, anchor+run) 一段
+    # prefill_run:     每个锚点的连续段长度
+    #
+    # 必须是【连续段】而不是孤立位置：warm 集 / churn / τ 都需要
+    # "同层前一个采样位置"，孤立位置在配对时会被整段丢弃，
+    # 前缀长度曲线会静默塌缩成单点。
     prefill_tail: int = 0
-    prefill_stride: int = 0
+    prefill_buckets: tuple = ()
+    prefill_run: int = 32
+
+    # MLA latent 捕获（想法 2：k^I 能否由已存的 c_s 线性重建）
+    # c_s = kv_c_normed [512]，k_pe [64]，两者合起来就是进 KV cache 的条目
+    capture_latent: bool = False
 
     # 运行时状态
     _step_data: dict = field(default_factory=dict)  # {(step, layer): {q, w, topk}}
     _prefill_data: dict = field(default_factory=dict)  # {(pos, layer): {...}}
     _k_buffers: dict = field(default_factory=dict)   # {layer: [k tensors]}
+    _c_buffers: dict = field(default_factory=dict)   # {layer: [kv_c tensors]}
+    _kpe_buffers: dict = field(default_factory=dict)  # {layer: [k_pe tensors]}
     _current_decode_step: int = field(default=0)
     _is_prefill: bool = field(default=True)
 
@@ -159,21 +175,25 @@ class IndexerStateCapturer:
 
     @property
     def capture_prefill_qw(self) -> bool:
-        return self.prefill_tail > 0 or self.prefill_stride > 0
+        return self.prefill_tail > 0 or bool(self.prefill_buckets)
+
+    def _in_bucket(self, pos: int) -> bool:
+        return any(a <= pos < a + self.prefill_run for a in self.prefill_buckets)
 
     def prefill_local_mask(self, positions):
         """给定本次 forward 的 prefill 绝对位置（升序），返回需要捕获的布尔掩码。
 
         chunked prefill 下每个 chunk 各自贡献"本 chunk 的最后 tail 个位置"，
-        跨 chunk 的全局滚动窗口由 _trim_prefill 收敛到真正的最后 tail 个。
-        与 torch/numpy 都兼容（只用索引和取模）。
+        跨 chunk 的全局滚动窗口由 _trim_prefill 收敛到真正的最后 tail 个；
+        bucket 段按绝对位置选，天然可跨 chunk 边界。
+        与 torch/numpy 都兼容。
         """
         n = int(positions.shape[0])
         mask = positions != positions  # 全 False，dtype=bool，device 跟随
         if self.prefill_tail > 0 and n > 0:
             mask[max(0, n - self.prefill_tail):] = True
-        if self.prefill_stride > 0:
-            mask = mask | (positions % self.prefill_stride == 0)
+        for a in self.prefill_buckets:
+            mask = mask | ((positions >= a) & (positions < a + self.prefill_run))
         return mask
 
     def capture_prefill_step(
@@ -213,18 +233,37 @@ class IndexerStateCapturer:
         self._trim_prefill(layer_id)
 
     def _trim_prefill(self, layer_id: int):
-        """只保留 stride 命中位置 + 最后 prefill_tail 个位置。"""
+        """只保留 bucket 段内的位置 + 最后 prefill_tail 个位置。"""
         positions = sorted(p for (p, l) in self._prefill_data if l == layer_id)
         if not positions:
             return
-        keep = set()
-        if self.prefill_stride > 0:
-            keep |= {p for p in positions if p % self.prefill_stride == 0}
+        keep = {p for p in positions if self._in_bucket(p)}
         if self.prefill_tail > 0:
             keep |= set(positions[-self.prefill_tail:])
         for p in positions:
             if p not in keep:
                 del self._prefill_data[(p, layer_id)]
+
+    def capture_mla_latent(self, layer_id: int, kv_c, k_pe):
+        """
+        截获 MLA 的 KV latent（想法 2 的裁决数据）。
+
+        kv_c: [n_tokens, kv_lora_rank=512]  post-LayerNorm，进 KV cache 的主体
+        k_pe: [n_tokens, 1, 64] 或 [n_tokens, 64]  post-RoPE
+        两者拼起来就是 paged KV cache 里每 token 存的条目；问题是
+        k^I（128 维）能否由它线性重建——若能，indexer 就不必单独存 k^I。
+
+        存 fp16：c/k_pe 都是 post-norm/post-RoPE 的 O(1) 量，
+        fp16 的 1e-3 相对误差远小于回归残差，可省一半体积。
+        """
+        if not self.should_capture() or not self.should_capture_layer(layer_id):
+            return
+        if not self.capture_latent:
+            return
+        self._c_buffers.setdefault(layer_id, []).append(
+            kv_c.detach().reshape(kv_c.shape[0], -1).half().cpu())
+        self._kpe_buffers.setdefault(layer_id, []).append(
+            k_pe.detach().reshape(k_pe.shape[0], -1).half().cpu())
 
     def advance_decode_step(self):
         """每个 decode step 结束后调用（所有层处理完后）。"""
@@ -273,6 +312,17 @@ class IndexerStateCapturer:
 
         logger.info(f"  Saved {n_steps} step-layer dumps")
 
+        # 保存 MLA latent（想法 2）
+        for buffers, name in ((self._c_buffers, "c_latent"),
+                              (self._kpe_buffers, "k_pe")):
+            for layer_id, chunks in buffers.items():
+                if not chunks:
+                    continue
+                arr = torch.cat(chunks, dim=0).numpy()
+                np.save(os.path.join(
+                    self.output_dir, f"{name}_layer{layer_id:03d}.npy"), arr)
+                logger.info(f"  Layer {layer_id}: {name} shape={arr.shape}")
+
         # 保存 prefill 位置采样
         n_prefill = 0
         for (pos, layer_id), data in sorted(self._prefill_data.items()):
@@ -293,10 +343,12 @@ class IndexerStateCapturer:
             ),
             "num_decode_steps": self.num_decode_steps,
             "prefill_tail": self.prefill_tail,
-            "prefill_stride": self.prefill_stride,
+            "prefill_buckets": list(self.prefill_buckets),
+            "prefill_run": self.prefill_run,
             "prefill_positions": sorted(
                 {p for (p, _) in self._prefill_data}
             ),
+            "capture_latent": self.capture_latent,
             "rank_id": self.rank,
         }
         if config_dict:
@@ -350,8 +402,12 @@ def get_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
                 save_every=int(os.environ.get("DSA_CAPTURE_SAVE_EVERY", "0")),
                 prefill_tail=int(
                     os.environ.get("DSA_CAPTURE_PREFILL_TAIL", "0")),
-                prefill_stride=int(
-                    os.environ.get("DSA_CAPTURE_PREFILL_STRIDE", "0")),
+                prefill_buckets=parse_int_list(
+                    os.environ.get("DSA_CAPTURE_PREFILL_BUCKETS", "")),
+                prefill_run=int(
+                    os.environ.get("DSA_CAPTURE_PREFILL_RUN", "32")),
+                capture_latent=os.environ.get(
+                    "DSA_CAPTURE_LATENT", "0").lower() in ("1", "true"),
             )
     return _global_capturer
 
@@ -379,7 +435,9 @@ def init_indexer_state_capturer(
     capture_layers: Optional[FrozenSet[int]] = None,
     save_every: int = 0,
     prefill_tail: int = 0,
-    prefill_stride: int = 0,
+    prefill_buckets: tuple = (),
+    prefill_run: int = 32,
+    capture_latent: bool = False,
 ) -> IndexerStateCapturer:
     capturer = IndexerStateCapturer(
         output_dir=output_dir,
@@ -389,7 +447,9 @@ def init_indexer_state_capturer(
         capture_layers=capture_layers,
         save_every=save_every,
         prefill_tail=prefill_tail,
-        prefill_stride=prefill_stride,
+        prefill_buckets=prefill_buckets,
+        prefill_run=prefill_run,
+        capture_latent=capture_latent,
     )
     set_indexer_state_capturer(capturer)
 
