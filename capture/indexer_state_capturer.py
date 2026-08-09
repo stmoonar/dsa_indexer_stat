@@ -65,6 +65,7 @@ class IndexerStateCapturer:
     enabled: bool = True
     rank: int = 0
     capture_layers: Optional[FrozenSet[int]] = None
+    save_every: int = 0  # 每 N 个 decode step 落盘一次（0 = 只在结束时落盘）
 
     # 运行时状态
     _step_data: dict = field(default_factory=dict)  # {(step, layer): {q, w, topk}}
@@ -122,6 +123,9 @@ class IndexerStateCapturer:
 
         if (self._current_decode_step, layer_id) in self._step_data:
             self._current_decode_step += 1
+            if (self.save_every > 0
+                    and self._current_decode_step % self.save_every == 0):
+                self.save()
 
         step = self._current_decode_step
 
@@ -247,6 +251,7 @@ def get_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
                 capture_layers=parse_layer_spec(
                     os.environ.get("DSA_CAPTURE_LAYERS", "")
                 ),
+                save_every=int(os.environ.get("DSA_CAPTURE_SAVE_EVERY", "0")),
             )
     return _global_capturer
 
@@ -272,6 +277,7 @@ def init_indexer_state_capturer(
     rank: int = 0,
     enabled: bool = True,
     capture_layers: Optional[FrozenSet[int]] = None,
+    save_every: int = 0,
 ) -> IndexerStateCapturer:
     capturer = IndexerStateCapturer(
         output_dir=output_dir,
@@ -279,11 +285,37 @@ def init_indexer_state_capturer(
         rank=rank,
         enabled=enabled,
         capture_layers=capture_layers,
+        save_every=save_every,
     )
     set_indexer_state_capturer(capturer)
 
-    # worker 进程正常退出时自动落盘（server 被 SIGTERM 优雅关闭即触发）
+    # worker 进程退出时自动落盘：
+    # - atexit 覆盖正常退出
+    # - SIGTERM handler 覆盖被 executor terminate() 的情况
+    #   （vLLM/SGLang 的多进程 worker 常以 SIGTERM 结束，默认不跑 atexit）
     if capturer.should_capture():
         import atexit
         atexit.register(capturer.save)
+
+        import signal
+        try:
+            prev_handler = signal.getsignal(signal.SIGTERM)
+
+            def _save_on_term(signum, frame):
+                try:
+                    capturer.save()
+                finally:
+                    if callable(prev_handler) and prev_handler not in (
+                        signal.SIG_IGN, signal.SIG_DFL
+                    ):
+                        prev_handler(signum, frame)
+                    else:
+                        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                        os.kill(os.getpid(), signal.SIGTERM)
+
+            signal.signal(signal.SIGTERM, _save_on_term)
+        except ValueError:
+            # 非主线程无法注册 signal handler，只依赖 atexit
+            logger.warning("Cannot register SIGTERM handler (non-main thread); "
+                           "relying on atexit for final save")
     return capturer

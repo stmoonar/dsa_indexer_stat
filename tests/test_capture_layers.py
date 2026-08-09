@@ -162,6 +162,47 @@ class TestEnvLazyInit:
         self._reset_global()
 
 
+class TestSaveEvery:
+
+    def test_periodic_save(self, tmp_path):
+        """save_every=2：每进入第 2、4… 个 step 时落盘一次。"""
+        cap = make_capturer(tmp_path, layers=frozenset({0}))
+        cap.save_every = 2
+        q, w, topk = fake_step_tensors()
+        for _ in range(5):  # steps 0..4
+            cap.capture_decode_step(0, q, w, topk)
+
+        # 进入 step 2 和 step 4 时各保存过一次 → 磁盘上已有 step 0-3 的 dump
+        assert (tmp_path / "step000000_layer000.npz").exists()
+        assert (tmp_path / "step000002_layer000.npz").exists()
+        assert not (tmp_path / "step000004_layer000.npz").exists()
+
+        cap.save()  # 结束时全量落盘
+        assert (tmp_path / "step000004_layer000.npz").exists()
+
+    def test_env_save_every(self, tmp_path, monkeypatch):
+        set_indexer_state_capturer(None)
+        isc._env_init_attempted = False
+        monkeypatch.setenv("DSA_CAPTURE_OUTPUT_DIR", str(tmp_path))
+        monkeypatch.setenv("DSA_CAPTURE_SAVE_EVERY", "64")
+        cap = get_indexer_state_capturer()
+        assert cap.save_every == 64
+        set_indexer_state_capturer(None)
+        isc._env_init_attempted = False
+
+    def test_sigterm_handler_registered(self, tmp_path):
+        """rank0 init 时注册 SIGTERM 落盘 handler（主线程内）。"""
+        import signal
+        prev = signal.getsignal(signal.SIGTERM)
+        try:
+            isc.init_indexer_state_capturer(output_dir=str(tmp_path))
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler) and handler is not prev
+        finally:
+            signal.signal(signal.SIGTERM, prev)
+            set_indexer_state_capturer(None)
+
+
 class TestPreparePrompt:
 
     def test_row_to_text_plain_string(self):

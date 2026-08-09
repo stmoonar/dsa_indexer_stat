@@ -1,0 +1,110 @@
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -103,6 +103,66 @@ from .utils import (
+ 
+ logger = init_logger(__name__)
+ 
++# === DSA-STAT PATCH: indexer state capture ===
++# 需要 dsa_indexer_stat 仓库根目录在 PYTHONPATH 上；capturer 由
++# DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS 环境变量在 worker 进程内
++# 惰性初始化（见 capture/indexer_state_capturer.py）。未设置时零开销。
++try:
++    from capture.indexer_state_capturer import get_indexer_state_capturer
++except ImportError:  # capture repo 不在 PYTHONPATH 上 -> 关闭 capture
++
++    def get_indexer_state_capturer():
++        return None
++
++
++def _dsa_stat_layer_id(prefix: str) -> int:
++    # prefix 形如 "model.layers.3.self_attn.indexer"
++    try:
++        return int(prefix.split("layers.")[1].split(".")[0])
++    except (IndexError, ValueError):
++        return -1
++
++
++def _dsa_stat_capture_indexer(indexer, q_bf16, k_bf16, raw_weights, topk_buffer):
++    """截获 q^I / k^I / raw w / topk_indices。
++
++    q_bf16: [T*H, d] post-RoPE bf16（量化前）
++    k_bf16: [T, d] post-RoPE bf16（量化/入 cache 前）
++    raw_weights: weights_proj 输出 * n_head^-0.5（不含 q_scale/softmax_scale）
++    topk_buffer: indexer op 返回的 topk_indices_buffer（全量 buffer，逐层复用）
++    """
++    cap = get_indexer_state_capturer()
++    if cap is None or not cap.should_capture():
++        return
++    layer_id = _dsa_stat_layer_id(indexer.prefix)
++    if layer_id < 0 or not cap.should_capture_layer(layer_id):
++        return
++    from vllm.forward_context import get_forward_context
++
++    attn_metadata = get_forward_context().attn_metadata
++    if not isinstance(attn_metadata, dict):
++        return  # dummy / profile run
++    meta = attn_metadata.get(indexer.k_cache.prefix)
++    if meta is None:
++        return
++    num_decode_tokens = meta.num_decode_tokens if meta.num_decodes > 0 else 0
++    n_tokens = k_bf16.shape[0]
++    if num_decode_tokens > 0:
++        cap.capture_decode_k(layer_id, k_bf16[:num_decode_tokens])
++        q3 = q_bf16.view(n_tokens, indexer.n_head, indexer.head_dim)
++        cap.capture_decode_step(
++            layer_id=layer_id,
++            query=q3[:num_decode_tokens],
++            weights=raw_weights[:num_decode_tokens],
++            topk_indices=topk_buffer[
++                :num_decode_tokens, : indexer.topk_tokens
++            ].clone(),
++        )
++    if n_tokens > num_decode_tokens:
++        cap.capture_prefill_k(layer_id, k_bf16[num_decode_tokens:])
++# === END DSA-STAT PATCH ===
++
++
+ 
+ class DeepseekAttention(nn.Module):
+     """Normal MHA implementation used by Deepseek v1."""
+@@ -724,12 +784,19 @@ class Indexer(nn.Module):
+         q_scale = q_scale.view(-1, self.n_head, 1)
+ 
+         weights, _ = self.weights_proj(hidden_states)
++        # === DSA-STAT PATCH: raw w * n_head^-0.5（不含 q_scale/softmax_scale）===
++        _dsa_raw_weights = weights * self.n_head**-0.5
++        # === END DSA-STAT PATCH ===
+         weights = (
+             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
+         )
+         weights = weights.squeeze(-1)
+ 
+-        return self.indexer_op(hidden_states, q_fp8, k, weights)
++        # === DSA-STAT PATCH: capture indexer state ===
++        topk_indices_buffer = self.indexer_op(hidden_states, q_fp8, k, weights)
++        _dsa_stat_capture_indexer(self, q, k, _dsa_raw_weights, topk_indices_buffer)
++        return topk_indices_buffer
++        # === END DSA-STAT PATCH ===
+ 
+ 
+ def _min_latency_fused_qkv_a_proj_impl(
+@@ -1469,6 +1536,18 @@ class DeepseekV2ForCausalLM(
+             if spec_layer is not None:
+                 continue  # skip spec decode layers for main model
+ 
++            # === DSA-STAT PATCH: 支持 --hf-overrides num_hidden_layers 截断 ===
++            # 官方 spec-layer 跳过只覆盖 [num_hidden_layers, +num_nextn)，
++            # 截断模型时 layer 6-60 的权重会在 params_dict[name] 处 KeyError。
++            if name.startswith("model.layers."):
++                _dsa_layer = name.split("model.layers.")[1].split(".")[0]
++                if (
++                    _dsa_layer.isdigit()
++                    and int(_dsa_layer) >= self.config.num_hidden_layers
++                ):
++                    continue
++            # === END DSA-STAT PATCH ===
++
+             is_fusion_moe_shared_experts_layer = (
+                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
+             )
