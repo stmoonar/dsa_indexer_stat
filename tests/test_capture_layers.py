@@ -203,6 +203,109 @@ class TestSaveEvery:
             set_indexer_state_capturer(None)
 
 
+class TestPrefillCapture:
+    """prefill q/w 采样：滚动尾窗 + stride，chunked prefill 下必须收敛到
+    全局最后 tail 个位置（这批数据的 query 是真实的，见 patch 注释）。"""
+
+    def make(self, tmp_path, tail=0, stride=0):
+        cap = make_capturer(tmp_path, layers=frozenset({0}))
+        cap.prefill_tail, cap.prefill_stride = tail, stride
+        return cap
+
+    def feed_chunk(self, cap, positions, layer=0):
+        """模拟一个 prefill chunk：按 mask 选行后交给 capturer。"""
+        pos = torch.tensor(positions)
+        mask = cap.prefill_local_mask(pos)
+        sel = mask.nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            return
+        n = len(positions)
+        q = torch.randn(n, H, D)
+        w = torch.randn(n, H)
+        topk = torch.arange(n * K, dtype=torch.int32).reshape(n, K)
+        cap.capture_prefill_step(layer, pos[sel].tolist(),
+                                 q[sel], w[sel], topk[sel])
+
+    def captured(self, cap, layer=0):
+        return sorted(p for (p, l) in cap._prefill_data if l == layer)
+
+    def test_disabled_by_default(self, tmp_path):
+        cap = self.make(tmp_path)
+        assert not cap.capture_prefill_qw
+        self.feed_chunk(cap, list(range(100)))
+        assert cap._prefill_data == {}
+
+    def test_tail_single_chunk(self, tmp_path):
+        cap = self.make(tmp_path, tail=8)
+        self.feed_chunk(cap, list(range(100)))
+        assert self.captured(cap) == list(range(92, 100))
+
+    def test_tail_across_chunks(self, tmp_path):
+        """chunked prefill：全局尾窗，且最后一个 chunk 比 tail 短。"""
+        cap = self.make(tmp_path, tail=8)
+        self.feed_chunk(cap, list(range(0, 64)))
+        self.feed_chunk(cap, list(range(64, 128)))
+        self.feed_chunk(cap, list(range(128, 131)))   # 只有 3 个位置
+        assert self.captured(cap) == list(range(123, 131))
+
+    def test_tail_is_contiguous(self, tmp_path):
+        """尾窗必须连续——warm 集/churn 分析依赖相邻位置。"""
+        cap = self.make(tmp_path, tail=16)
+        for start in range(0, 200, 32):
+            self.feed_chunk(cap, list(range(start, min(start + 32, 200))))
+        got = self.captured(cap)
+        assert got == list(range(184, 200))
+        assert all(b - a == 1 for a, b in zip(got, got[1:]))
+
+    def test_stride_kept_across_trim(self, tmp_path):
+        cap = self.make(tmp_path, tail=4, stride=50)
+        for start in range(0, 200, 40):
+            self.feed_chunk(cap, list(range(start, start + 40)))
+        got = self.captured(cap)
+        assert {0, 50, 100, 150} <= set(got), got     # stride 命中不被裁掉
+        assert set(range(196, 200)) <= set(got), got  # 尾窗保留
+
+    def test_saved_files_and_config(self, tmp_path):
+        cap = self.make(tmp_path, tail=4)
+        self.feed_chunk(cap, list(range(20)))
+        cap.save()
+        for p in range(16, 20):
+            assert (tmp_path / f"prefill_pos{p:08d}_layer000.npz").exists()
+        cfg = json.load(open(tmp_path / "capture_config.json"))
+        assert cfg["prefill_tail"] == 4
+        assert cfg["prefill_positions"] == [16, 17, 18, 19]
+
+    def test_roundtrip_through_loader(self, tmp_path):
+        from replay.loader import (list_prefill_positions, load_prefill_dump,
+                                   iter_prefill)
+        cap = self.make(tmp_path, tail=3)
+        self.feed_chunk(cap, list(range(10)))
+        cap.save()
+        assert list_prefill_positions(str(tmp_path), 0) == [7, 8, 9]
+        d = load_prefill_dump(str(tmp_path), 0, 9)
+        assert d["q_I"].shape == (H, D)
+        assert d["w"].shape == (H,)
+        assert d["topk_indices"].shape == (K,)
+        assert len(list(iter_prefill(str(tmp_path), 0))) == 3
+
+    def test_layer_filter_applies(self, tmp_path):
+        cap = self.make(tmp_path, tail=4)     # capture_layers = {0}
+        self.feed_chunk(cap, list(range(10)), layer=3)
+        assert cap._prefill_data == {}
+
+    def test_env_init(self, tmp_path, monkeypatch):
+        set_indexer_state_capturer(None)
+        isc._env_init_attempted = False
+        monkeypatch.setenv("DSA_CAPTURE_OUTPUT_DIR", str(tmp_path))
+        monkeypatch.setenv("DSA_CAPTURE_PREFILL_TAIL", "64")
+        monkeypatch.setenv("DSA_CAPTURE_PREFILL_STRIDE", "4096")
+        cap = get_indexer_state_capturer()
+        assert (cap.prefill_tail, cap.prefill_stride) == (64, 4096)
+        assert cap.capture_prefill_qw
+        set_indexer_state_capturer(None)
+        isc._env_init_attempted = False
+
+
 class TestVllmPerfDefaults:
 
     def test_with_deep_gemm(self):

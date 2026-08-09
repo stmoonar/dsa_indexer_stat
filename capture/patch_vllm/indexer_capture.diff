@@ -1,14 +1,15 @@
 diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
 --- a/vllm/model_executor/models/deepseek_v2.py
 +++ b/vllm/model_executor/models/deepseek_v2.py
-@@ -103,6 +103,66 @@ from .utils import (
+@@ -103,6 +103,93 @@ from .utils import (
  
  logger = init_logger(__name__)
  
 +# === DSA-STAT PATCH: indexer state capture ===
 +# 需要 dsa_indexer_stat 仓库根目录在 PYTHONPATH 上；capturer 由
-+# DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS 环境变量在 worker 进程内
-+# 惰性初始化（见 capture/indexer_state_capturer.py）。未设置时零开销。
++# DSA_CAPTURE_OUTPUT_DIR / DSA_CAPTURE_LAYERS / DSA_CAPTURE_PREFILL_TAIL 等
++# 环境变量在 worker 进程内惰性初始化（见 capture/indexer_state_capturer.py）。
++# 未设置 DSA_CAPTURE_OUTPUT_DIR 时零开销。
 +try:
 +    from capture.indexer_state_capturer import get_indexer_state_capturer
 +except ImportError:  # capture repo 不在 PYTHONPATH 上 -> 关闭 capture
@@ -25,13 +26,18 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 +        return -1
 +
 +
-+def _dsa_stat_capture_indexer(indexer, q_bf16, k_bf16, raw_weights, topk_buffer):
++def _dsa_stat_capture_indexer(
++    indexer, positions, q_bf16, k_bf16, raw_weights, topk_buffer
++):
 +    """截获 q^I / k^I / raw w / topk_indices。
 +
 +    q_bf16: [T*H, d] post-RoPE bf16（量化前）
 +    k_bf16: [T, d] post-RoPE bf16（量化/入 cache 前）
 +    raw_weights: weights_proj 输出 * n_head^-0.5（不含 q_scale/softmax_scale）
 +    topk_buffer: indexer op 返回的 topk_indices_buffer（全量 buffer，逐层复用）
++
++    decode 段与 prefill 段分别落到 step / prefill 两套 dump。
++    prefill 的 q/w 只按 capturer 的采样策略抓少量位置（滚动尾窗 + stride）。
 +    """
 +    cap = get_indexer_state_capturer()
 +    if cap is None or not cap.should_capture():
@@ -49,9 +55,10 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 +        return
 +    num_decode_tokens = meta.num_decode_tokens if meta.num_decodes > 0 else 0
 +    n_tokens = k_bf16.shape[0]
++    q3 = q_bf16.view(n_tokens, indexer.n_head, indexer.head_dim)
++
 +    if num_decode_tokens > 0:
 +        cap.capture_decode_k(layer_id, k_bf16[:num_decode_tokens])
-+        q3 = q_bf16.view(n_tokens, indexer.n_head, indexer.head_dim)
 +        cap.capture_decode_step(
 +            layer_id=layer_id,
 +            query=q3[:num_decode_tokens],
@@ -60,15 +67,35 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 +                :num_decode_tokens, : indexer.topk_tokens
 +            ].clone(),
 +        )
-+    if n_tokens > num_decode_tokens:
-+        cap.capture_prefill_k(layer_id, k_bf16[num_decode_tokens:])
++
++    if n_tokens <= num_decode_tokens:
++        return
++    cap.capture_prefill_k(layer_id, k_bf16[num_decode_tokens:])
++    if not cap.capture_prefill_qw:
++        return
++    pos_all = positions.reshape(-1)
++    if pos_all.shape[0] != n_tokens:
++        return  # 形状不符（padding 等），放弃 prefill q/w 采样
++    pos = pos_all[num_decode_tokens:]
++    sel = cap.prefill_local_mask(pos).nonzero(as_tuple=True)[0]
++    if sel.numel() == 0:
++        return
++    cap.capture_prefill_step(
++        layer_id=layer_id,
++        positions=pos[sel].tolist(),
++        query=q3[num_decode_tokens:][sel],
++        weights=raw_weights[num_decode_tokens:][sel],
++        topk_indices=topk_buffer[
++            num_decode_tokens:n_tokens, : indexer.topk_tokens
++        ][sel],
++    )
 +# === END DSA-STAT PATCH ===
 +
 +
  
  class DeepseekAttention(nn.Module):
      """Normal MHA implementation used by Deepseek v1."""
-@@ -724,12 +784,19 @@ class Indexer(nn.Module):
+@@ -724,12 +811,21 @@ class Indexer(nn.Module):
          q_scale = q_scale.view(-1, self.n_head, 1)
  
          weights, _ = self.weights_proj(hidden_states)
@@ -83,17 +110,19 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 -        return self.indexer_op(hidden_states, q_fp8, k, weights)
 +        # === DSA-STAT PATCH: capture indexer state ===
 +        topk_indices_buffer = self.indexer_op(hidden_states, q_fp8, k, weights)
-+        _dsa_stat_capture_indexer(self, q, k, _dsa_raw_weights, topk_indices_buffer)
++        _dsa_stat_capture_indexer(
++            self, positions, q, k, _dsa_raw_weights, topk_indices_buffer
++        )
 +        return topk_indices_buffer
 +        # === END DSA-STAT PATCH ===
  
  
  def _min_latency_fused_qkv_a_proj_impl(
-@@ -1469,6 +1536,18 @@ class DeepseekV2ForCausalLM(
+@@ -1469,6 +1565,18 @@ class DeepseekV2ForCausalLM(
              if spec_layer is not None:
                  continue  # skip spec decode layers for main model
  
-+            # === DSA-STAT PATCH: 支持 --hf-overrides num_hidden_layers 截断 ===
++            # === DSA-STAT PATCH: 支持 hf_overrides num_hidden_layers 截断 ===
 +            # 官方 spec-layer 跳过只覆盖 [num_hidden_layers, +num_nextn)，
 +            # 截断模型时 layer 6-60 的权重会在 params_dict[name] 处 KeyError。
 +            if name.startswith("model.layers."):

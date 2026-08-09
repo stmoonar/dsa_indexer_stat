@@ -86,6 +86,13 @@ export DSA_CAPTURE_OUTPUT_DIR="${REPO_ROOT}/${OUTPUT_DIR}"
 export DSA_CAPTURE_LAYERS="${CAPTURE_LAYERS}"
 export DSA_CAPTURE_NUM_LAYERS="${NUM_LAYERS}"
 export DSA_CAPTURE_SAVE_EVERY="${DSA_CAPTURE_SAVE_EVERY:-64}"
+# prefill 期真实 query 采样：
+#   TAIL   = 保留最后 N 个 prefill 位置（连续，可算 warm 集 / churn）
+#   STRIDE = 额外每 N 个位置抓一个（上下文长度扫描；0 = 关）
+# 截断模型下 layer 0-4 的 prefill q/k/w 与全模型逐位一致，
+# 因此这批数据不受"decode 轨迹是乱码"的污染。
+export DSA_CAPTURE_PREFILL_TAIL="${PREFILL_TAIL:-64}"
+export DSA_CAPTURE_PREFILL_STRIDE="${PREFILL_STRIDE:-4096}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 MAX_MODEL_LEN=$(( CONTEXT_LENGTH + MAX_NEW_TOKENS + 512 ))
@@ -113,8 +120,11 @@ echo ""
 echo "[4/4] Verifying dump output..."
 N_K=$(ls "${OUTPUT_DIR}"/k_I_layer*.npy 2>/dev/null | wc -l)
 N_STEP=$(ls "${OUTPUT_DIR}"/step*_layer*.npz 2>/dev/null | wc -l)
+N_PREFILL=$(ls "${OUTPUT_DIR}"/prefill_pos*_layer*.npz 2>/dev/null | wc -l)
 echo "k_I buffers:      ${N_K} (expect ${NUM_LAYERS})"
 echo "step-layer dumps: ${N_STEP} (expect ~$(( MAX_NEW_TOKENS * NUM_LAYERS )))"
+echo "prefill dumps:    ${N_PREFILL} (真实 query，tail=${DSA_CAPTURE_PREFILL_TAIL} "\
+"stride=${DSA_CAPTURE_PREFILL_STRIDE})"
 
 GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 VLLM_HASH=$(git -C "${VLLM_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -131,6 +141,8 @@ cat > "${OUTPUT_DIR}/run_meta.json" <<EOF
   "context_length": ${CONTEXT_LENGTH},
   "max_new_tokens": ${MAX_NEW_TOKENS},
   "capture_layers": "${CAPTURE_LAYERS}",
+  "prefill_tail": ${DSA_CAPTURE_PREFILL_TAIL},
+  "prefill_stride": ${DSA_CAPTURE_PREFILL_STRIDE},
   "tp": ${TP},
   "max_model_len": ${MAX_MODEL_LEN},
   "timestamp": "${TIMESTAMP}"

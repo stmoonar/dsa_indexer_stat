@@ -67,8 +67,16 @@ class IndexerStateCapturer:
     capture_layers: Optional[FrozenSet[int]] = None
     save_every: int = 0  # 每 N 个 decode step 落盘一次（0 = 只在结束时落盘）
 
+    # prefill 期的 q/w 采样（0 = 不采）
+    # prefill_tail: 保留最后 N 个 prefill 位置（滚动窗口，连续，
+    #   等价于"真实 query 版的 decode step"，可算 warm 集 / churn）
+    # prefill_stride: 额外保留 pos % stride == 0 的位置（上下文长度扫描用）
+    prefill_tail: int = 0
+    prefill_stride: int = 0
+
     # 运行时状态
     _step_data: dict = field(default_factory=dict)  # {(step, layer): {q, w, topk}}
+    _prefill_data: dict = field(default_factory=dict)  # {(pos, layer): {...}}
     _k_buffers: dict = field(default_factory=dict)   # {layer: [k tensors]}
     _current_decode_step: int = field(default=0)
     _is_prefill: bool = field(default=True)
@@ -149,6 +157,75 @@ class IndexerStateCapturer:
             "topk_indices": topk.numpy(),
         }
 
+    @property
+    def capture_prefill_qw(self) -> bool:
+        return self.prefill_tail > 0 or self.prefill_stride > 0
+
+    def prefill_local_mask(self, positions):
+        """给定本次 forward 的 prefill 绝对位置（升序），返回需要捕获的布尔掩码。
+
+        chunked prefill 下每个 chunk 各自贡献"本 chunk 的最后 tail 个位置"，
+        跨 chunk 的全局滚动窗口由 _trim_prefill 收敛到真正的最后 tail 个。
+        与 torch/numpy 都兼容（只用索引和取模）。
+        """
+        n = int(positions.shape[0])
+        mask = positions != positions  # 全 False，dtype=bool，device 跟随
+        if self.prefill_tail > 0 and n > 0:
+            mask[max(0, n - self.prefill_tail):] = True
+        if self.prefill_stride > 0:
+            mask = mask | (positions % self.prefill_stride == 0)
+        return mask
+
+    def capture_prefill_step(
+        self,
+        layer_id: int,
+        positions,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ):
+        """
+        Prefill 阶段截获选定位置的 q^I, w, topk_indices。
+
+        与 decode 的语义差别只在"步"的含义：这里的键是绝对位置 pos，
+        该位置的 indexer 对 k^I[:pos+1] 打分（因果）。
+        前 5 层的 prefill q/k/w 不受截断影响，与全模型逐位一致。
+
+        positions: [n] 绝对位置（int）
+        query: [n, H, d_I]，weights: [n, H]，topk_indices: [n, top_k]
+        """
+        if not self.should_capture() or not self.should_capture_layer(layer_id):
+            return
+        if not self.capture_prefill_qw:
+            return
+
+        pos_list = [int(p) for p in positions]
+        q = query.detach().float().cpu().numpy()
+        w = weights.detach().float().cpu().numpy()
+        t = topk_indices.detach().cpu().to(torch.int32).numpy()
+
+        for i, pos in enumerate(pos_list):
+            self._prefill_data[(pos, layer_id)] = {
+                "q_I": q[i],
+                "w": w[i],
+                "topk_indices": t[i],
+            }
+        self._trim_prefill(layer_id)
+
+    def _trim_prefill(self, layer_id: int):
+        """只保留 stride 命中位置 + 最后 prefill_tail 个位置。"""
+        positions = sorted(p for (p, l) in self._prefill_data if l == layer_id)
+        if not positions:
+            return
+        keep = set()
+        if self.prefill_stride > 0:
+            keep |= {p for p in positions if p % self.prefill_stride == 0}
+        if self.prefill_tail > 0:
+            keep |= set(positions[-self.prefill_tail:])
+        for p in positions:
+            if p not in keep:
+                del self._prefill_data[(p, layer_id)]
+
     def advance_decode_step(self):
         """每个 decode step 结束后调用（所有层处理完后）。"""
         if self.should_capture():
@@ -196,6 +273,17 @@ class IndexerStateCapturer:
 
         logger.info(f"  Saved {n_steps} step-layer dumps")
 
+        # 保存 prefill 位置采样
+        n_prefill = 0
+        for (pos, layer_id), data in sorted(self._prefill_data.items()):
+            path = os.path.join(
+                self.output_dir, f"prefill_pos{pos:08d}_layer{layer_id:03d}.npz"
+            )
+            np.savez(path, **data)
+            n_prefill += 1
+        if n_prefill:
+            logger.info(f"  Saved {n_prefill} prefill position dumps")
+
         # 保存 config（约束 13：run 输出目录必须含配置快照）
         import json
         merged = {
@@ -204,6 +292,11 @@ class IndexerStateCapturer:
                 sorted(self.capture_layers) if self.capture_layers else "all"
             ),
             "num_decode_steps": self.num_decode_steps,
+            "prefill_tail": self.prefill_tail,
+            "prefill_stride": self.prefill_stride,
+            "prefill_positions": sorted(
+                {p for (p, _) in self._prefill_data}
+            ),
             "rank_id": self.rank,
         }
         if config_dict:
@@ -234,9 +327,12 @@ def get_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
     每个 TP worker 进程在首次 forward 时自动建立 capturer（约束 10）。
 
     环境变量：
-      DSA_CAPTURE_OUTPUT_DIR  dump 输出目录（未设置 → 不 capture）
-      DSA_CAPTURE_LAYERS      层过滤，如 "0-4"（默认全部层）
-      DSA_CAPTURE_NUM_LAYERS  模型层数（默认 61）
+      DSA_CAPTURE_OUTPUT_DIR    dump 输出目录（未设置 → 不 capture）
+      DSA_CAPTURE_LAYERS        层过滤，如 "0-4"（默认全部层）
+      DSA_CAPTURE_NUM_LAYERS    模型层数（默认 61）
+      DSA_CAPTURE_SAVE_EVERY    每 N 个 decode step 落盘一次（默认 0 = 不周期落盘）
+      DSA_CAPTURE_PREFILL_TAIL  保留最后 N 个 prefill 位置的 q/w（默认 0 = 不采）
+      DSA_CAPTURE_PREFILL_STRIDE 额外采样 pos%N==0 的 prefill 位置（默认 0 = 关）
     """
     global _env_init_attempted
     if _global_capturer is None and not _env_init_attempted:
@@ -252,6 +348,10 @@ def get_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
                     os.environ.get("DSA_CAPTURE_LAYERS", "")
                 ),
                 save_every=int(os.environ.get("DSA_CAPTURE_SAVE_EVERY", "0")),
+                prefill_tail=int(
+                    os.environ.get("DSA_CAPTURE_PREFILL_TAIL", "0")),
+                prefill_stride=int(
+                    os.environ.get("DSA_CAPTURE_PREFILL_STRIDE", "0")),
             )
     return _global_capturer
 
@@ -278,6 +378,8 @@ def init_indexer_state_capturer(
     enabled: bool = True,
     capture_layers: Optional[FrozenSet[int]] = None,
     save_every: int = 0,
+    prefill_tail: int = 0,
+    prefill_stride: int = 0,
 ) -> IndexerStateCapturer:
     capturer = IndexerStateCapturer(
         output_dir=output_dir,
@@ -286,6 +388,8 @@ def init_indexer_state_capturer(
         enabled=enabled,
         capture_layers=capture_layers,
         save_every=save_every,
+        prefill_tail=prefill_tail,
+        prefill_stride=prefill_stride,
     )
     set_indexer_state_capturer(capturer)
 
