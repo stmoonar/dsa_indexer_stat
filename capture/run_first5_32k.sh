@@ -31,6 +31,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# 可选 conda 环境（默认不激活；CONDA_ENV=<name> 启用）
+CONDA_ENV="${CONDA_ENV-}"
+if [[ -n "${CONDA_ENV}" && "${CONDA_DEFAULT_ENV:-}" != "${CONDA_ENV}" ]]; then
+    if command -v conda >/dev/null 2>&1; then
+        source "$(conda info --base)/etc/profile.d/conda.sh"
+        conda activate "${CONDA_ENV}"
+        echo "Activated conda env: ${CONDA_ENV} ($(which python))"
+    else
+        echo "WARNING: conda not on PATH; using current python ($(which python))."
+    fi
+fi
+
 MODEL_PATH="${MODEL_PATH:-/data1/models/DeepSeek-V3.2}"
 DATASET_DIR="${DATASET_DIR:-/data/datasets/lmcache-agentic-traces/data}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
@@ -148,10 +160,26 @@ cat > "${OUTPUT_DIR}/run_meta.json" <<EOF
 }
 EOF
 cp "${PROMPT_FILE}.meta.json" "${OUTPUT_DIR}/prompt_meta.json" 2>/dev/null || true
+cp "${LOG_FILE}" "${OUTPUT_DIR}/" 2>/dev/null || true
+
+# 打包结果（不完整也打包，便于拿下来排查）
+echo ""
+echo "Packaging results..."
+python - "${OUTPUT_DIR}" <<'PY'
+import os, sys, shutil
+out = sys.argv[1].rstrip("/")
+zip_path = shutil.make_archive(
+    out, "zip",
+    root_dir=os.path.dirname(out) or ".",
+    base_dir=os.path.basename(out),
+)
+print(f"Zipped: {zip_path} ({os.path.getsize(zip_path) / 1e6:.1f} MB)")
+PY
 
 if [[ "${N_K}" -eq "${NUM_LAYERS}" && "${N_STEP}" -gt 0 ]]; then
-    echo "OK: capture output looks complete → ${OUTPUT_DIR}"
+    echo "OK: capture output complete → ${OUTPUT_DIR}"
+    echo "    下载: ${OUTPUT_DIR}.zip"
 else
-    echo "WARNING: output incomplete, check ${LOG_FILE}"
+    echo "WARNING: output incomplete (zip 仍已生成，便于排查), check ${LOG_FILE}"
     exit 1
 fi
