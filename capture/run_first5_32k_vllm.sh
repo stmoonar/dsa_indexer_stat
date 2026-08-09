@@ -122,13 +122,21 @@ EXTRA_ARGS=()
 
 # Step 2: 逐条序列跑（每条一个独立进程）
 echo "[3/4] Running vLLM offline generation, one process per sequence..."
+# MAX_SEQS 限制实际要跑的序列条数（manifest 里可能有更多）。
+# 容差标定必须复用主 run 的同一条 prompt，故用 MAX_SEQS=1 指向同一个 manifest，
+# 而不是另起一个 PROMPT_PREFIX——后者会重新挑样本，两个 run 的输入就不同了。
 mapfile -t SEQS < <(python -c "
-import json, sys
+import json, os
 m = json.load(open('${MANIFEST}'))
-for s in m['sequences']:
+limit = int(os.environ.get('MAX_SEQS') or 0)
+seqs = m['sequences'][:limit] if limit > 0 else m['sequences']
+for s in seqs:
     print(s['name'], s['path'], s['n_tokens'], sep='\t')
 ")
 echo "Sequences to run: ${#SEQS[@]}"
+if [[ "${#SEQS[@]}" -eq 0 ]]; then
+    echo "ERROR: no sequences in ${MANIFEST}"; exit 1
+fi
 
 for row in "${SEQS[@]}"; do
     NAME=$(cut -f1 <<< "${row}")
@@ -198,18 +206,25 @@ done
 
 echo ""
 echo "Packaging results..."
-python - "${OUTPUT_ROOT}" <<'PY'
+# 默认只打可下载的瘦身包：丢掉 decode dump 与 c_latent，k_I 降到 fp16
+# （源头是 bf16，fp16 无损；实测测量数字逐位不变）。
+# 原始目录本来就在服务器上，重分析在服务器跑即可；FULL_ZIP=1 才打全量包。
+python -m analysis.slim_run "${OUTPUT_ROOT}" \
+    --profile "${SLIM_PROFILE:-geometry}" 2>&1 | tail -6
+if [[ "${FULL_ZIP:-0}" == "1" ]]; then
+    python - "${OUTPUT_ROOT}" <<'PY'
 import os, sys, shutil
 out = sys.argv[1].rstrip("/")
 z = shutil.make_archive(out, "zip", root_dir=os.path.dirname(out) or ".",
                         base_dir=os.path.basename(out))
-print(f"Zipped: {z} ({os.path.getsize(z) / 1e6:.1f} MB)")
+print(f"Full zip: {z} ({os.path.getsize(z) / 1e6:.1f} MB)")
 PY
+fi
 
 if [[ "${OK}" == "1" ]]; then
     echo "OK: capture complete → ${OUTPUT_ROOT}"
-    echo "    下载: ${OUTPUT_ROOT}.zip"
+    echo "    下载: ${OUTPUT_ROOT}_${SLIM_PROFILE:-geometry}.zip"
 else
-    echo "WARNING: output incomplete (zip 仍已生成，便于排查), check ${LOG_FILE}"
+    echo "WARNING: output incomplete (包仍已生成，便于排查), check ${LOG_FILE}"
     exit 1
 fi

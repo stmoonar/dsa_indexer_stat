@@ -50,19 +50,22 @@ run_one "A_32k_tp8" \
     CONTEXT_LENGTH=32768 TP=8 N_SAMPLES="${N_SAMPLES_MAIN}" \
     PROMPT_PREFIX=prompts/agentic_32K
 
-# ---- B) 32K × TP=4 × 1 条（容差标定，复用 A 的 seq00）----
-# 用同一个 PROMPT_PREFIX + 已存在的 manifest -> 不会重新挑样本；
-# N_SAMPLES=1 时只跑 manifest 里的第一条，正好是 A 的 seq00。
+# ---- B) 32K × TP=4 × 1 条（容差标定）----
+# 必须与 A 用【同一条 prompt】，否则标出来的偏差里混着输入差异。
+# 所以指向 A 的同一个 PROMPT_PREFIX（manifest 已存在 -> 不重新挑样本），
+# 用 MAX_SEQS=1 只跑其中的 seq00。
 run_one "B_32k_tp4_calib" \
-    CONTEXT_LENGTH=32768 TP=4 N_SAMPLES=1 \
-    PROMPT_PREFIX=prompts/agentic_32K_calib \
+    CONTEXT_LENGTH=32768 TP=4 MAX_SEQS=1 \
+    PROMPT_PREFIX=prompts/agentic_32K \
     PREFILL_TAIL=8 PREFILL_BUCKETS=16384 PREFILL_RUN=8 \
     CAPTURE_LATENT=0
 
 # ---- C) 128K × TP=8 × 1 条（主配置的真实几何）----
+# 想法 2 的 c_latent 只需一个 run，A 已经有了；128K 再存一份没有额外信息，
+# 却要多 671MB，故关掉。
 if [[ "${SKIP_128K:-0}" != "1" ]]; then
     run_one "C_128k_tp8" \
-        CONTEXT_LENGTH=131072 TP=8 N_SAMPLES=1 CONCAT=1 \
+        CONTEXT_LENGTH=131072 TP=8 N_SAMPLES=1 CONCAT=1 CAPTURE_LATENT=0 \
         PROMPT_PREFIX=prompts/agentic_128K
 fi
 
