@@ -225,6 +225,47 @@ class TestReconstruction:
         assert out["r2_heldout"] < 0.1
         assert out["topk_overlap_p50"] < 0.5
 
+    def test_shuffled_baseline_separates_signal_from_misalignment(self):
+        """真有线性关系时，R² 必须明显高于打乱基线；否则该指标无法把
+        '关系不存在' 和 '配对错位' 区分开。"""
+        g = torch.Generator().manual_seed(4)
+        L = 800
+        c = torch.randn(L, 32, generator=g)
+        kpe = torch.randn(L, 8, generator=g)
+        k_I = torch.cat([c, kpe], 1) @ torch.randn(40, D, generator=g)
+        out = reconstruction_test(k_I, c, kpe, [], [], n_fit=300)
+        assert out["signal_above_shuffle"] > 0.9
+        assert out["r2_shuffled_baseline"] < 0.1
+
+    def test_detects_leading_offset_in_latent(self):
+        """latent 多出开头几行（dummy forward 被误采）时必须报出来，
+        并改用尾对齐把关系找回来。"""
+        g = torch.Generator().manual_seed(5)
+        L, pad = 800, 37
+        c = torch.randn(L, 32, generator=g)
+        kpe = torch.randn(L, 8, generator=g)
+        k_I = torch.cat([c, kpe], 1) @ torch.randn(40, D, generator=g)
+        c_bad = torch.cat([torch.randn(pad, 32, generator=g), c])
+        kpe_bad = torch.cat([torch.randn(pad, 8, generator=g), kpe])
+
+        out = reconstruction_test(k_I, c_bad, kpe_bad, [], [], n_fit=300)
+        assert out["row_mismatch"] == pad
+        assert out["tail_aligned"] is True
+        assert out["r2_heldout"] > 0.99, "尾对齐后应恢复出线性关系"
+
+    def test_misaligned_pairing_looks_like_no_signal(self):
+        """行数相同但内容错位时 R² 会塌到打乱基线水平——
+        这正是必须靠 signal_above_shuffle 才能识别的情形。"""
+        g = torch.Generator().manual_seed(6)
+        L = 800
+        c = torch.randn(L, 32, generator=g)
+        kpe = torch.randn(L, 8, generator=g)
+        k_I = torch.cat([c, kpe], 1) @ torch.randn(40, D, generator=g)
+        roll = torch.roll(torch.arange(L), 137)
+        out = reconstruction_test(k_I, c[roll], kpe[roll], [], [], n_fit=300)
+        assert out["row_mismatch"] == 0
+        assert out["signal_above_shuffle"] < 0.05
+
     def test_fit_and_eval_positions_disjoint(self):
         g = torch.Generator().manual_seed(3)
         L = 400

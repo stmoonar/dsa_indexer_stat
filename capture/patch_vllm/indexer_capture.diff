@@ -141,7 +141,7 @@ diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/mod
 diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
 --- a/vllm/model_executor/layers/mla.py
 +++ b/vllm/model_executor/layers/mla.py
-@@ -164,6 +164,30 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+@@ -164,6 +164,40 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                  hidden_states, q_c, positions, self.indexer_rope_emb
              )
  
@@ -150,6 +150,10 @@ diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.
 +            # 每 token 存的条目；要回答的是 k^I(128) 能否由它线性重建。
 +            # 这两个张量只在 MLA forward 里可见，indexer 拿不到，故在此 hook。
 +            # 仅当 DSA_CAPTURE_LATENT=1 时开销非零。
++            #
++            # dummy/profile run 必须跳过：indexer 侧的捕获也会跳过它，
++            # 这里不跳就会给 c_latent 多出一段开头的垃圾行，与 k_I 整体错位，
++            # 回归看到的就是"零信号"。
 +            try:
 +                from capture.indexer_state_capturer import (
 +                    get_indexer_state_capturer as _dsa_get_cap,
@@ -159,14 +163,20 @@ diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.
 +            if _dsa_get_cap is not None:
 +                _dsa_cap = _dsa_get_cap()
 +                if _dsa_cap is not None and _dsa_cap.capture_latent:
-+                    try:
-+                        _dsa_lid = int(
-+                            self.indexer.prefix.split("layers.")[1].split(".")[0]
-+                        )
-+                    except (IndexError, ValueError):
-+                        _dsa_lid = -1
-+                    if _dsa_lid >= 0:
-+                        _dsa_cap.capture_mla_latent(_dsa_lid, kv_c_normed, k_pe)
++                    from vllm.forward_context import (
++                        get_forward_context as _dsa_get_ctx,
++                    )
++                    if isinstance(_dsa_get_ctx().attn_metadata, dict):
++                        try:
++                            _dsa_lid = int(
++                                self.indexer.prefix.split("layers.")[1]
++                                .split(".")[0]
++                            )
++                        except (IndexError, ValueError):
++                            _dsa_lid = -1
++                        if _dsa_lid >= 0:
++                            _dsa_cap.capture_mla_latent(
++                                _dsa_lid, kv_c_normed, k_pe)
 +            # === END DSA-STAT PATCH ===
 +
          if llama_4_scaling is not None:

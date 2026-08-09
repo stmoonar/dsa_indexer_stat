@@ -258,9 +258,19 @@ def write_report(res: dict, path: str):
                   + f"; 有效秩 {sp.get('effective_rank', 0):.1f}\n")
             rc = lres.get("reconstruction")
             if rc:
-                A(f"**想法 2 (k^I←c_s 重建)**: R²={rc.get('r2_heldout', 0):.4f}, "
+                A(f"**想法 2 (k^I←c_s 重建)**: R²={rc.get('r2_heldout', 0):.4f} "
+                  f"(打乱基线 {rc.get('r2_shuffled_baseline', 0):.4f}), "
                   f"top-k overlap p50={rc.get('topk_overlap_p50', 0):.4f}, "
                   f"min={rc.get('topk_overlap_min', 0):.4f}\n")
+                mis = rc.get("row_mismatch", 0)
+                if mis:
+                    A(f"> ⚠ latent 比 k^I 多 {mis} 行"
+                      f"（{'已改用尾对齐' if rc.get('tail_aligned') else '行数不足'}）。"
+                      f"若该 run 的 patch 缺 dummy-run 守卫，两者本就错位，"
+                      f"此处结果不可用，需重采后再判。\n")
+                if rc.get("signal_above_shuffle", 1) < 0.02:
+                    A("> ⚠ R² 与打乱基线相当 —— 配对本身没有信息"
+                      "（错位或采错张量），这不是「线性关系不存在」的证据。\n")
     open(path, "w", encoding="utf-8").write("\n".join(L))
 
 

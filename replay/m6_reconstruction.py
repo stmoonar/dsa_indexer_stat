@@ -51,8 +51,22 @@ def reconstruction_test(k_I, c_latent, k_pe, q_samples, w_samples,
 
     拟合位置与评估位置不相交。
     """
-    L = min(k_I.shape[0], c_latent.shape[0], k_pe.shape[0])
-    k_I, c_latent, k_pe = k_I[:L], c_latent[:L].float(), k_pe[:L].float()
+    # 行数一致性：latent 与 k^I 必须来自同一批 token。
+    # 若 latent 多出一段（例如 dummy/profile forward 被误采），头对齐会把
+    # 两边整体错开，回归结果是"零信号"——那是 bug，不是负结论。
+    n_k, n_c = k_I.shape[0], min(c_latent.shape[0], k_pe.shape[0])
+    align = {"n_rows_k_I": int(n_k), "n_rows_latent": int(n_c),
+             "row_mismatch": int(n_c - n_k)}
+    L = min(n_k, n_c)
+    k_I = k_I[:L]
+    if n_c > n_k:
+        # 多出的行若在开头，尾对齐才是正确的配对；两种都算，报出来
+        align["tail_aligned"] = True
+        c_latent, k_pe = c_latent[n_c - L:], k_pe[n_c - L:]
+    else:
+        align["tail_aligned"] = False
+        c_latent, k_pe = c_latent[:L], k_pe[:L]
+    c_latent, k_pe = c_latent.float(), k_pe.float()
     X = torch.cat([c_latent, k_pe], dim=1)
 
     g = torch.Generator().manual_seed(seed)
@@ -68,7 +82,16 @@ def reconstruction_test(k_I, c_latent, k_pe, q_samples, w_samples,
         "r2_heldout": r2_score(k_I[held], k_hat_held),
         "input_dim": int(X.shape[1]),
         "output_dim": int(k_I.shape[1]),
+        **align,
     }
+
+    # 打乱基线：把 latent 行随机置换后重拟合。若真实 R² 与它相当，
+    # 说明配对本身没有信息（错位 / 采错张量），而不是"线性关系不存在"。
+    shuf = X[torch.randperm(L, generator=g)]
+    W_s = fit_linear(shuf[fit_idx], k_I[fit_idx])
+    out["r2_shuffled_baseline"] = r2_score(k_I[held],
+                                           apply_linear(shuf[held], W_s))
+    out["signal_above_shuffle"] = out["r2_heldout"] - out["r2_shuffled_baseline"]
 
     # 用重建的 k̂ 重跑 top-k（全序列），与真 k 的 top-k 比
     k_hat_all = apply_linear(X, W)
