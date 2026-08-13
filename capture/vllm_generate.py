@@ -10,12 +10,15 @@ max_num_seqs=1 保证 bs=1。
 
 模型截断：hf_overrides={"num_hidden_layers": N}，配合
 capture/patch_vllm/indexer_capture.diff 中的 load_weights 跳层逻辑。
+--num-layers 0 = 不截断（全 61 层），走 2 节点 TP=16 + ray。
 
 用法（DSA_CAPTURE_* 环境变量需在启动前 export，见 run_first5_32k_vllm.sh）：
     python -m capture.vllm_generate \
         --model /data1/models/DeepSeek-V3.2 \
         --prompt-file prompts/agentic_32k.txt \
         --num-layers 5 --tp 8 --max-model-len 33792 --max-new-tokens 256
+    python -m capture.vllm_generate ... \
+        --num-layers 0 --tp 16 --distributed-executor-backend ray
 """
 
 import os
@@ -52,6 +55,44 @@ def resolve_perf_defaults(has_deep_gemm: bool, truncated: bool = False):
     return 2048, (0.45 if truncated else 0.65)
 
 
+def missing_carry_over(environ_names, copy_set) -> list:
+    """列出不会被 ray 带到远端 worker 的 DSA_CAPTURE_* 变量。
+
+    多节点时 worker 是远端 ray actor，只继承 vLLM 白名单里的环境变量
+    （vllm/ray/ray_env.py：VLLM_/NCCL_/HF_ 等前缀 + 注册过的 vllm envs）。
+    DSA_CAPTURE_* 不在其中 —— 漏掉的后果不是报错而是【静默不 dump】，
+    在一个要加载 685GB 权重的 run 上，这是最贵的一类失败。
+    修复办法：export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=DSA_
+    """
+    return sorted(n for n in environ_names
+                  if n.startswith("DSA_CAPTURE") and n not in copy_set)
+
+
+def check_ray_capture_env(backend: str, tp: int):
+    """多节点 ray 下的预检：直接问 vLLM 自己的拷贝白名单，不猜版本。"""
+    if not os.environ.get("DSA_CAPTURE_OUTPUT_DIR", "").strip():
+        return
+    try:
+        import torch
+        local_gpus = torch.cuda.device_count()
+    except Exception:
+        local_gpus = 0
+    if backend != "ray" and tp <= max(local_gpus, 1):
+        return
+    try:
+        from vllm.ray.ray_env import get_env_vars_to_copy
+    except ImportError:
+        print("WARNING: 无法导入 vllm.ray.ray_env，跳过环境变量传播预检；"
+              "请自行确认远端 worker 能看到 DSA_CAPTURE_*")
+        return
+    missing = missing_carry_over(os.environ, get_env_vars_to_copy())
+    if missing:
+        raise RuntimeError(
+            f"这些 capture 环境变量不会传到远端 ray worker: {missing}\n"
+            f"  export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=DSA_\n"
+            f"（漏掉不会报错，只会静默不 dump——不允许在全模型 run 上赌）")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -65,7 +106,12 @@ def main():
                     help="缺省自动：有 DeepGEMM 0.85，无 0.65")
     ap.add_argument("--max-num-batched-tokens", type=int, default=None,
                     help="prefill chunk 大小；缺省自动：无 DeepGEMM 时 2048")
+    ap.add_argument("--distributed-executor-backend", default=None,
+                    choices=(None, "mp", "ray"),
+                    help="跨节点（TP 超过单机卡数）必须是 ray")
     args = ap.parse_args()
+
+    check_ray_capture_env(args.distributed_executor_backend, args.tp)
 
     has_dg = deep_gemm_available()
     auto_chunk, auto_util = resolve_perf_defaults(
@@ -105,6 +151,9 @@ def main():
     )
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.distributed_executor_backend:
+        llm_kwargs["distributed_executor_backend"] = \
+            args.distributed_executor_backend
     llm = LLM(**llm_kwargs)
 
     sampling = SamplingParams(

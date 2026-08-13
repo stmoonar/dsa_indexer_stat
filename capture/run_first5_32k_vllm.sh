@@ -6,6 +6,9 @@
 #   跳层加载依赖 patch 中的 load_weights 修改（vLLM 原生会 KeyError）。
 #   约束 7: enforce_eager（= 关 CUDA graph + torch.compile）, max_num_seqs=1
 #
+#   NUM_LAYERS=0 = 不截断（全 61 层）。单机 8×H800 装不下 685GB fp8，
+#   需要 2 节点 TP=16 + DIST_BACKEND=ray，见 capture/run_full61_vllm.sh。
+#
 # 数据有效性（重要）：
 #   prefill 段的 k^I / q^I / w 与全 61 层模型逐位一致 —— 可信。
 #   decode 段是乱码 token 轨迹上的统计 —— 不可信，仅供 kernel 对齐抽查。
@@ -49,14 +52,27 @@ DATASET_DIR="${DATASET_DIR:-/data/datasets/lmcache-agentic-traces/data}"
 VLLM_SRC="${VLLM_SRC:-/workspace/vllm}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8}"   # decode 统计不可用，只留少量步做 kernel 抽查
-NUM_LAYERS="${NUM_LAYERS:-5}"
+NUM_LAYERS="${NUM_LAYERS:-5}"           # 0 = 不截断（全模型）
+MODEL_LAYERS="${MODEL_LAYERS:-61}"      # 未截断时的真实层数（V3.2 = 61）
 TP="${TP:-8}"
+DIST_BACKEND="${DIST_BACKEND:-}"        # 跨节点必须是 ray
 N_SAMPLES="${N_SAMPLES:-3}"             # 序列间方差需要 >1
 CONCAT="${CONCAT:-0}"                   # 128K 时置 1（单条 trace 不够长）
 CAPTURE_LAYERS="${CAPTURE_LAYERS:-all}"
 
+# 模型实际层数 / 期望的 k_I 文件数（校验用）
+if [[ "${NUM_LAYERS}" -gt 0 ]]; then
+    ACTIVE_LAYERS="${NUM_LAYERS}"
+else
+    ACTIVE_LAYERS="${MODEL_LAYERS}"
+fi
+
 CTX_TAG=$(( CONTEXT_LENGTH / 1024 ))K
-RUN_TAG="${RUN_TAG:-first${NUM_LAYERS}_${CTX_TAG}_tp${TP}}"
+if [[ "${NUM_LAYERS}" -gt 0 ]]; then
+    RUN_TAG="${RUN_TAG:-first${NUM_LAYERS}_${CTX_TAG}_tp${TP}}"
+else
+    RUN_TAG="${RUN_TAG:-full${MODEL_LAYERS}_${CTX_TAG}_tp${TP}}"
+fi
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/${RUN_TAG}_${TIMESTAMP}}"
 PROMPT_PREFIX="${PROMPT_PREFIX:-prompts/agentic_${CTX_TAG}}"
@@ -64,8 +80,12 @@ PROMPT_PREFIX="${PROMPT_PREFIX:-prompts/agentic_${CTX_TAG}}"
 mkdir -p "${OUTPUT_ROOT}" logs prompts
 LOG_FILE="logs/capture_${RUN_TAG}_${TIMESTAMP}.log"
 
-echo "=== [vLLM] first-${NUM_LAYERS}-layers capture ==="
-echo "Model:    ${MODEL_PATH} (truncated to ${NUM_LAYERS} layers)"
+echo "=== [vLLM] ${ACTIVE_LAYERS}-layer capture ==="
+if [[ "${NUM_LAYERS}" -gt 0 ]]; then
+    echo "Model:    ${MODEL_PATH} (truncated to ${NUM_LAYERS} layers)"
+else
+    echo "Model:    ${MODEL_PATH} (full ${MODEL_LAYERS} layers, no truncation)"
+fi
 echo "vLLM:     ${VLLM_SRC}"
 echo "Context:  ${CONTEXT_LENGTH}   TP: ${TP}   sequences: ${N_SAMPLES}"
 echo "Output:   ${OUTPUT_ROOT}"
@@ -97,7 +117,7 @@ fi
 
 # 通用 capture 环境变量（每条序列只改 OUTPUT_DIR）
 export DSA_CAPTURE_LAYERS="${CAPTURE_LAYERS}"
-export DSA_CAPTURE_NUM_LAYERS="${NUM_LAYERS}"
+export DSA_CAPTURE_NUM_LAYERS="${ACTIVE_LAYERS}"
 export DSA_CAPTURE_SAVE_EVERY="${DSA_CAPTURE_SAVE_EVERY:-64}"
 # prefill 真实 query 采样：尾窗 + 分桶【连续段】
 # 必须是连续段：warm 集 / τ / churn 都要求"同层前一个采样位置"，
@@ -114,11 +134,17 @@ export DSA_CAPTURE_PREFILL_BUCKETS="${PREFILL_BUCKETS}"
 # MLA latent（想法 2：k^I 能否由已存的 c_s 线性重建）
 export DSA_CAPTURE_LATENT="${CAPTURE_LATENT:-1}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+# 跨节点时 worker 是远端 ray actor，只继承 vLLM 白名单里的环境变量；
+# DSA_CAPTURE_* 不在白名单里，漏掉的后果是【静默不 dump】。
+# 单机也设，无副作用。vllm_generate 里还有一道预检。
+export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY="DSA_${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY:+,${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY}}"
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="PYTHONPATH${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+,${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY}}"
 
 MAX_MODEL_LEN=$(( CONTEXT_LENGTH + MAX_NEW_TOKENS + 512 ))
 EXTRA_ARGS=()
 [[ -n "${MAX_BATCHED_TOKENS:-}" ]] && EXTRA_ARGS+=(--max-num-batched-tokens "${MAX_BATCHED_TOKENS}")
 [[ -n "${GPU_MEM_UTIL:-}" ]] && EXTRA_ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
+[[ -n "${DIST_BACKEND}" ]] && EXTRA_ARGS+=(--distributed-executor-backend "${DIST_BACKEND}")
 
 # Step 2: 逐条序列跑（每条一个独立进程）
 echo "[3/4] Running vLLM offline generation, one process per sequence..."
@@ -171,7 +197,9 @@ cat > "${OUTPUT_ROOT}/run_meta.json" <<EOF
   "vllm_git_hash": "${VLLM_HASH}",
   "model_path": "${MODEL_PATH}",
   "num_hidden_layers_override": ${NUM_LAYERS},
-  "model_truncated": true,
+  "active_layers": ${ACTIVE_LAYERS},
+  "model_truncated": $([[ "${NUM_LAYERS}" -gt 0 ]] && echo true || echo false),
+  "distributed_executor_backend": "${DIST_BACKEND:-auto}",
   "dataset_dir": "${DATASET_DIR}",
   "prompt_prefix": "${PROMPT_PREFIX}",
   "n_sequences": ${#SEQS[@]},
@@ -190,6 +218,14 @@ EOF
 cp "${MANIFEST}" "${OUTPUT_ROOT}/prompt_manifest.json" 2>/dev/null || true
 cp "${LOG_FILE}" "${OUTPUT_ROOT}/" 2>/dev/null || true
 
+# 期望的 k_I 文件数：CAPTURE_LAYERS 过滤后、且在模型实际层范围内的层数
+EXPECT_K=$(python -c "
+from capture.indexer_state_capturer import parse_layer_spec
+sel = parse_layer_spec('${CAPTURE_LAYERS}')
+n = ${ACTIVE_LAYERS}
+print(n if sel is None else len([l for l in sel if 0 <= l < n]))
+")
+
 OK=1
 for row in "${SEQS[@]}"; do
     NAME=$(cut -f1 <<< "${row}")
@@ -198,8 +234,8 @@ for row in "${SEQS[@]}"; do
     N_PF=$(ls "${D}"/prefill_pos*_layer*.npz 2>/dev/null | wc -l)
     N_LAT=$(ls "${D}"/c_latent_layer*.npy 2>/dev/null | wc -l)
     N_STEP=$(ls "${D}"/step*_layer*.npz 2>/dev/null | wc -l)
-    echo "  ${NAME}: k_I=${N_K}/${NUM_LAYERS}  prefill=${N_PF}  latent=${N_LAT}  decode=${N_STEP}"
-    if [[ "${N_K}" -ne "${NUM_LAYERS}" || "${N_PF}" -eq 0 ]]; then
+    echo "  ${NAME}: k_I=${N_K}/${EXPECT_K}  prefill=${N_PF}  latent=${N_LAT}  decode=${N_STEP}"
+    if [[ "${N_K}" -ne "${EXPECT_K}" || "${N_PF}" -eq 0 ]]; then
         OK=0
     fi
 done
@@ -209,8 +245,13 @@ echo "Packaging results..."
 # 默认只打可下载的瘦身包：丢掉 decode dump 与 c_latent，k_I 降到 fp16
 # （源头是 bf16，fp16 无损；实测测量数字逐位不变）。
 # 原始目录本来就在服务器上，重分析在服务器跑即可；FULL_ZIP=1 才打全量包。
+# SLIM_KEEP_DECODE=1：全模型 run 的 decode 段是真实轨迹（截断 run 才是乱码），
+# 值得带进下载包。
+SLIM_ARGS=()
+[[ "${SLIM_KEEP_DECODE:-0}" == "1" ]] && SLIM_ARGS+=(--keep-decode)
 python -m analysis.slim_run "${OUTPUT_ROOT}" \
-    --profile "${SLIM_PROFILE:-geometry}" 2>&1 | tail -6
+    --profile "${SLIM_PROFILE:-geometry}" \
+    ${SLIM_ARGS[@]+"${SLIM_ARGS[@]}"} 2>&1 | tail -6
 if [[ "${FULL_ZIP:-0}" == "1" ]]; then
     python - "${OUTPUT_ROOT}" <<'PY'
 import os, sys, shutil

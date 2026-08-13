@@ -391,6 +391,39 @@ class TestVllmPerfDefaults:
         assert util * 79.1 > 5 + 10  # 权重 + 充裕的 KV/激活余量
 
 
+class TestRayEnvCarryOver:
+    """跨节点 ray：DSA_CAPTURE_* 不在 vLLM 的默认拷贝白名单里。
+
+    漏掉不会报错，只会让远端 worker 的 capturer 静默关闭 —— 在一个要
+    加载 685GB 权重的全模型 run 上，这类失败的代价最高，必须预检。
+    """
+
+    def test_flags_unpropagated_capture_vars(self):
+        from capture.vllm_generate import missing_carry_over
+        env = ["DSA_CAPTURE_OUTPUT_DIR", "DSA_CAPTURE_LAYERS", "VLLM_USE_V1"]
+        assert missing_carry_over(env, {"VLLM_USE_V1"}) == [
+            "DSA_CAPTURE_LAYERS", "DSA_CAPTURE_OUTPUT_DIR"]
+
+    def test_silent_when_all_covered(self):
+        from capture.vllm_generate import missing_carry_over
+        env = ["DSA_CAPTURE_OUTPUT_DIR", "PATH"]
+        assert missing_carry_over(env, {"DSA_CAPTURE_OUTPUT_DIR"}) == []
+
+    def test_prefix_export_in_runner_covers_them(self):
+        """runner 里 export 的前缀必须真的能覆盖 DSA_CAPTURE_*。"""
+        from capture.vllm_generate import missing_carry_over
+        prefix = "DSA_"
+        env = ["DSA_CAPTURE_OUTPUT_DIR", "DSA_CAPTURE_PREFILL_TAIL"]
+        copy_set = {n for n in env if n.startswith(prefix)}
+        assert missing_carry_over(env, copy_set) == []
+
+    def test_runner_exports_the_prefix(self):
+        runner = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "capture", "run_first5_32k_vllm.sh")
+        text = open(runner, encoding="utf-8").read()
+        assert "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=\"DSA_" in text
+
+
 class TestPreparePrompt:
 
     def test_row_to_text_plain_string(self):
