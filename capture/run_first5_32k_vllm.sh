@@ -226,14 +226,26 @@ n = ${ACTIVE_LAYERS}
 print(n if sel is None else len([l for l in sel if 0 <= l < n]))
 ")
 
+# 统计 glob 匹配数。不能用 `ls glob | wc -l`：glob 无匹配时 ls 退出码是 2，
+# wc 是 0，在 `set -euo pipefail` 下整条管道算 2，赋值语句继承它 → 脚本在
+# 打印诊断行【之前】静默退出。这个坑只在"一个文件都没产出"时触发，
+# 恰好把最需要看到的那种失败盖成一句无信息的 "smoke 失败"。
+count_glob() {
+    local n=0 f
+    for f in "$@"; do
+        if [[ -e "${f}" ]]; then n=$((n + 1)); fi
+    done
+    printf '%s' "${n}"
+}
+
 OK=1
 for row in "${SEQS[@]}"; do
     NAME=$(cut -f1 <<< "${row}")
     D="${OUTPUT_ROOT}/${NAME}"
-    N_K=$(ls "${D}"/k_I_layer*.npy 2>/dev/null | wc -l)
-    N_PF=$(ls "${D}"/prefill_pos*_layer*.npz 2>/dev/null | wc -l)
-    N_LAT=$(ls "${D}"/c_latent_layer*.npy 2>/dev/null | wc -l)
-    N_STEP=$(ls "${D}"/step*_layer*.npz 2>/dev/null | wc -l)
+    N_K=$(count_glob "${D}"/k_I_layer*.npy)
+    N_PF=$(count_glob "${D}"/prefill_pos*_layer*.npz)
+    N_LAT=$(count_glob "${D}"/c_latent_layer*.npy)
+    N_STEP=$(count_glob "${D}"/step*_layer*.npz)
     echo "  ${NAME}: k_I=${N_K}/${EXPECT_K}  prefill=${N_PF}  latent=${N_LAT}  decode=${N_STEP}"
     if [[ "${N_K}" -ne "${EXPECT_K}" || "${N_PF}" -eq 0 ]]; then
         OK=0

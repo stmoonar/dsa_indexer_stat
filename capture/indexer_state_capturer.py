@@ -96,6 +96,9 @@ class IndexerStateCapturer:
     _kpe_buffers: dict = field(default_factory=dict)  # {layer: [k_pe tensors]}
     _current_decode_step: int = field(default=0)
     _is_prefill: bool = field(default=True)
+    # 已由 vllm_generate 的 collective_rpc 显式落过盘；用于抑制 atexit 重复写
+    # （61 层一次 save 是 GB 级，写两遍纯浪费）
+    _explicit_save_done: bool = field(default=False)
 
     def should_capture(self) -> bool:
         return self.enabled and self.rank == 0
@@ -417,6 +420,17 @@ def set_indexer_state_capturer(capturer: Optional[IndexerStateCapturer]):
     _global_capturer = capturer
 
 
+def get_existing_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
+    """返回已存在的 capturer，绝不惰性初始化。
+
+    显式落盘（vllm_generate 的 collective_rpc）必须用这个而不是
+    get_indexer_state_capturer()：后者会在从未 capture 过的进程里凭空建一个
+    capturer 并写出一份空的 capture_config.json，把"hook 根本没被调用"
+    伪装成"调用了但没采到数据"——正好毁掉最关键的那条诊断信息。
+    """
+    return _global_capturer
+
+
 def _detect_rank() -> int:
     try:
         import torch.distributed as dist
@@ -459,7 +473,13 @@ def init_indexer_state_capturer(
     #   （vLLM/SGLang 的多进程 worker 常以 SIGTERM 结束，默认不跑 atexit）
     if capturer.should_capture():
         import atexit
-        atexit.register(capturer.save)
+
+        def _final_save():
+            # vllm_generate 已通过 collective_rpc 显式落过盘就不重复写。
+            if not capturer._explicit_save_done:
+                capturer.save()
+
+        atexit.register(_final_save)
 
         import signal
         try:
@@ -467,7 +487,7 @@ def init_indexer_state_capturer(
 
             def _save_on_term(signum, frame):
                 try:
-                    capturer.save()
+                    _final_save()
                 finally:
                     if callable(prev_handler) and prev_handler not in (
                         signal.SIG_IGN, signal.SIG_DFL
