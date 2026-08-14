@@ -29,6 +29,12 @@ import importlib.util
 
 import numpy as np
 
+# collective_rpc 传 callable 需要它：vLLM 默认只接受 msgspec 可序列化的类型，
+# 否则报 "Object of type <class 'function'> is not serializable"。
+# 这是本地 offline 脚本，driver 与 worker 都是自己拉起的进程，不存在不可信输入。
+# VLLM_ 前缀在 ray 的环境变量拷贝白名单里，会自动带到远端 worker。
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 
 def deep_gemm_available() -> bool:
     """与 vllm.utils.deep_gemm.is_deep_gemm_supported 的软件侧条件一致：
@@ -195,38 +201,20 @@ def main():
     del llm
 
 
-def _dsa_worker_save(_worker):
-    """在 worker 进程内显式落盘。返回值是诊断信息，由 driver 打印。
-
-    第一个参数是 vLLM 传进来的 Worker 实例，这里用不到。
-    """
-    try:
-        from capture.indexer_state_capturer import (
-            get_existing_indexer_state_capturer,
-        )
-    except ImportError:
-        return "no-pythonpath"
-    cap = get_existing_indexer_state_capturer()
-    if cap is None:
-        # 该进程里 capturer 从未被创建 = patch 的 hook 一次都没被调用
-        return "no-capturer"
-    if not cap.should_capture():
-        return f"rank={cap.rank} skip(non-rank0)"
-    cap.save()
-    cap._explicit_save_done = True
-    return (f"rank={cap.rank} saved k_I_layers={len(cap._k_buffers)} "
-            f"prefill={len(cap._prefill_data)} -> {cap.output_dir}")
-
-
 def save_capturers_now(llm):
     """生成结束后主动落盘，并把每个 worker 的结果打出来。
 
     这同时是诊断：'no-capturer' 说明 patch 的 hook 从未被调用，
     'skip(non-rank0)' 出现在全部 16 个 worker 上说明 rank0 不在本次
     executor 的 worker 列表里 —— 两种都会导致零产出，但原因完全不同。
+
+    dsa_worker_save 从 capture.indexer_state_capturer 导入而不是定义在
+    本文件里：本文件以 python -m 运行（模块名 __main__），pickle 会把
+    __main__ 里的函数按引用序列化，worker 侧解不开。
     """
     try:
-        results = llm.collective_rpc(_dsa_worker_save)
+        from capture.indexer_state_capturer import dsa_worker_save
+        results = llm.collective_rpc(dsa_worker_save)
     except Exception as e:
         print(f"WARNING: collective save 失败 ({type(e).__name__}: {e})；"
               "退回到 atexit/SIGTERM —— ray backend 下大概率丢数据。")

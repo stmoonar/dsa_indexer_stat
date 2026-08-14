@@ -431,6 +431,28 @@ def get_existing_indexer_state_capturer() -> Optional[IndexerStateCapturer]:
     return _global_capturer
 
 
+def dsa_worker_save(_worker=None) -> str:
+    """在 worker 进程内显式落盘，返回值是给 driver 打印的诊断字符串。
+
+    必须定义在【真实模块】里，不能放进 vllm_generate：后者以 python -m
+    运行，模块名是 __main__，collective_rpc 的 pickle 对 __main__ 里的
+    函数按引用序列化（"__main__.xxx"），而 worker 侧的 __main__ 是 ray
+    的入口，反序列化必然失败。
+
+    参数是 vLLM 传进来的 Worker 实例，这里用不到。
+    """
+    cap = get_existing_indexer_state_capturer()
+    if cap is None:
+        # 该进程里 capturer 从未被创建 = patch 的 hook 一次都没被调用
+        return "no-capturer"
+    if not cap.should_capture():
+        return f"rank={cap.rank} skip(non-rank0)"
+    cap.save()
+    cap._explicit_save_done = True
+    return (f"rank={cap.rank} saved k_I_layers={len(cap._k_buffers)} "
+            f"prefill={len(cap._prefill_data)} -> {cap.output_dir}")
+
+
 def _detect_rank() -> int:
     try:
         import torch.distributed as dist
