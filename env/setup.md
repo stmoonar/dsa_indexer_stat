@@ -39,28 +39,69 @@ rank 8-15 上，rank != 0 → 后半段静默不 dump。TP=16 时每个 rank 都
 61 层，rank0 一份就是完整数据；ray 的 worker 排序保证 rank0 落在 driver
 节点，dump 写在本地盘。
 
+### 步骤（**两个节点**上都要做 1-2，第 3 步只在 head 节点跑）
+
+**1. 两节点各自准备**（缺一个都会在加载 685GB 权重之后才炸）
+
 ```bash
-# 两个节点都要：仓库与 vLLM 在同一绝对路径，且都已 apply patch
-bash capture/apply_vllm_patch.sh
+# 仓库与 vLLM 必须在两节点的【同一绝对路径】下（或同一共享 FS），
+# 模型权重同理：同路径的本地副本，或共享盘
+cd /path/to/dsa_indexer_stat
+VLLM_SRC=/workspace/vllm bash capture/apply_vllm_patch.sh   # 幂等，各节点各跑一次
+python -m pytest tests/ -q                                  # 约束 11
+```
 
-# head 节点
-export PYTHONPATH=$(pwd)      # 必须在 ray start 之前，worker 进程继承它
+**2. 两节点起 ray**（head 先起）
+
+```bash
+# ---- head 节点 ----
+export PYTHONPATH=/path/to/dsa_indexer_stat   # 必须在 ray start 之前：
+                                              # ray worker 进程继承 ray start 的环境
+export VLLM_HOST_IP=<HEAD_NODE_IP>            # 多网卡时不设会 "No available node types"
+export NCCL_IB_HCA=mlx5                       # IB 设备名，按 ibstat 实际输出改
+export NCCL_SOCKET_IFNAME=<IB 或内网网卡名>
 ray start --head --port=6379
-# worker 节点
-export PYTHONPATH=/same/path/to/repo
-ray start --address=<head_ip>:6379
-ray status                    # 必须看到 16 GPU
 
-# 从 head 节点跑（capture → 金丝雀 → 层间相似性 → m1-m6）
-REF_RUN=runs/A_32k_tp8_XXX/seq00 DSA_TOL=<标定值> \
+# ---- worker 节点 ----
+export PYTHONPATH=/path/to/dsa_indexer_stat   # 同一路径
+export VLLM_HOST_IP=<WORKER_NODE_IP>          # 每个节点不同，填自己的
+export NCCL_IB_HCA=mlx5
+export NCCL_SOCKET_IFNAME=<同上>
+ray start --address=<HEAD_NODE_IP>:6379
+
+# ---- 任一节点核对 ----
+ray status && ray list nodes    # 必须是 2 个 node、16 GPU
+```
+
+注意 NCCL/IB 相关变量要在 `ray start` 之前 export：在 shell 里临时设只影响本节点的
+后续进程，ray worker 只继承 `ray start` 时的环境（vLLM 会额外把 `NCCL_` 前缀的变量
+从 driver 带过去，两处都设最稳）。
+
+**3. head 节点一条命令跑完**
+
+```bash
+REF_RUN=runs/A_32k_tp8_XXX/seq00 \
     VLLM_SRC=/workspace/vllm bash capture/run_full61_vllm.sh
 ```
 
-**最容易踩的坑**：`DSA_CAPTURE_*` 不在 vLLM 传给远端 ray worker 的环境变量
-白名单里（`vllm/ray/ray_env.py` 只带 VLLM_/NCCL_/HF_ 等前缀），漏掉不会报错，
-只会静默不 dump。runner 已 export
-`VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=DSA_`，`vllm_generate` 里还有一道
-预检直接问 vLLM 的白名单——两道都别删。
+它按顺序做：ray 预检（GPU 数够不够）→ **5 层 × TP=16 的 smoke**（~30GB 权重，
+先验证多节点通路，别拿 685GB 试错；约束 12）→ 用 smoke 与 `REF_RUN` 现场标定
+`DSA_TOL` → 全 61 层 capture → 全模型金丝雀（layer 0-4）→ 层间 top-k 相似性 →
+m1-m6。已经标过容差就 `SKIP_SMOKE=1 DSA_TOL=<值>` 直接烧。
+
+`REF_RUN` 必须是**同一条 prompt**的截断 run 的 `seqNN` 目录（脚本默认
+`PROMPT_PREFIX` 指向 suite A 的 manifest，manifest 存在就不重挑样本）。
+
+### 两个坑
+
+- **`DSA_CAPTURE_*` 不会自动传到远端 ray worker**：`vllm/ray/ray_env.py` 的白名单
+  只带 `VLLM_`/`NCCL_`/`HF_` 等前缀。漏掉不报错，只会让远端 worker 的 capturer
+  静默关闭。runner 已 export `VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=DSA_`，
+  `vllm_generate` 里还有一道预检直接调 vLLM 的 `get_env_vars_to_copy()` 核对——
+  两道都别删。
+- **确认真的走上了 IB**：`NCCL_DEBUG=TRACE` 下日志里应出现 `via NET/IB`；
+  出现 `via NET/Socket` 说明退化成 TCP，TP=16 跨节点会慢到不可用。
+  smoke 阶段就该看这个，别等全模型。
 
 ## replay 环境
 - 单卡即可（H800 或 A100）

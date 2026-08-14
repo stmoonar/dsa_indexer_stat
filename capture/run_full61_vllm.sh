@@ -16,16 +16,17 @@
 #      检查:   ray status   # 必须看到 16 GPU
 #   3) tests/ 全绿（约束 11）
 #
-# 金丝雀（约束 12 的精神）：全模型 run 的 layer 0-4 prefill 段必须与已有的
-#   截断 run 一致。REF_RUN 必须与本 run 用【同一条 prompt】，所以默认
-#   PROMPT_PREFIX 指向 suite A 的 manifest 且 MAX_SEQS=1（不重挑样本）。
-#   TP 不同（8 vs 16）→ all-reduce 求和顺序不同 → 逐位相等不成立，
-#   容差用 analysis/calibrate_tolerance.py 标出来的 DSA_TOL，不要猜。
+# 金丝雀：全模型 run 的 layer 0-4 prefill 段必须与已有的截断 run 一致。
+#   REF_RUN 必须与本 run 用【同一条 prompt】，所以默认 PROMPT_PREFIX 指向
+#   suite A 的 manifest 且 MAX_SEQS=1（manifest 已存在 → 不重挑样本）。
+#   TP 不同（8 vs 16）→ all-reduce 求和顺序不同 → 逐位相等不成立；容差不猜，
+#   由 stage 0.5 的 TP=16 截断 smoke 与 REF_RUN 现场标定（DSA_TOL 显式给则用给的）。
 #
 # 用法：
-#   REF_RUN=runs/A_32k_tp8_XXX/seq00 DSA_TOL=2e-3 \
+#   REF_RUN=runs/A_32k_tp8_XXX/seq00 \
 #       VLLM_SRC=/workspace/vllm bash capture/run_full61_vllm.sh
 #   CONTEXT_LENGTH=131072 CONCAT=1 bash capture/run_full61_vllm.sh
+#   SKIP_SMOKE=1 DSA_TOL=1e-2 bash capture/run_full61_vllm.sh   # 已标过，直接烧
 
 set -uo pipefail
 
@@ -56,6 +57,46 @@ if [[ "${RAY_GPUS}" -lt "${TP}" ]]; then
     echo "ERROR: ray 集群只有 ${RAY_GPUS} 张卡，不够 TP=${TP}。"
     echo "       worker 节点是否执行了 ray start --address=<head_ip>:6379 ?"
     exit 1
+fi
+
+# ---- 0.5) smoke：5 层 × TP=16（约束 12：先 smoke 再烧大的）----
+# 一次跑到三个目的：
+#   a) 用 ~30GB 权重验证 ray / NCCL / IB 通路，而不是拿 685GB 去试错
+#   b) 与 REF_RUN（同 prompt 的 TP=8 截断 run）比，标定 TP=16 求和顺序下的
+#      DSA_TOL —— 全模型金丝雀要的就是这个值，不该靠猜
+#   c) 全链路（capture → dump → 分析）在多节点上跑通一遍
+if [[ "${SKIP_SMOKE:-0}" != "1" ]]; then
+    echo ""
+    echo "=== [0.5/4] smoke: 5 层 × TP=${TP} ==="
+    SMOKE_ROOT="runs/smoke_first5_tp${TP}_${STAMP}"
+    NUM_LAYERS=5 TP="${TP}" DIST_BACKEND=ray \
+        CONTEXT_LENGTH="${CONTEXT_LENGTH}" \
+        CAPTURE_LAYERS=all CAPTURE_LATENT=0 \
+        MAX_SEQS=1 N_SAMPLES=1 CONCAT="${CONCAT:-0}" \
+        PROMPT_PREFIX="${PROMPT_PREFIX:-prompts/agentic_${CTX_TAG}}" \
+        OUTPUT_ROOT="${SMOKE_ROOT}" RUN_TAG="smoke_first5_tp${TP}" \
+        bash capture/run_first5_32k_vllm.sh
+    if [[ $? -ne 0 ]]; then
+        echo "ERROR: smoke 失败 —— 多节点通路没打通，不要往下烧全模型。"
+        echo "       先查: ray status / ray list nodes / NCCL_DEBUG=TRACE 下"
+        echo "       是否出现 'via NET/IB'（出现 NET/Socket 说明没走上 IB）"
+        exit 1
+    fi
+    SMOKE_SEQ=$(ls -d "${SMOKE_ROOT}"/seq* 2>/dev/null | head -1)
+    SMOKE_SEQ="${SMOKE_SEQ:-${SMOKE_ROOT}}"
+
+    # 标定容差：只在用户没显式给 DSA_TOL 时自动取
+    if [[ -n "${REF_RUN}" && "${DSA_TOL}" == "0" ]]; then
+        echo ""
+        echo "--- 标定 DSA_TOL (${REF_RUN} vs ${SMOKE_SEQ}) ---"
+        python -m analysis.calibrate_tolerance "${REF_RUN}" "${SMOKE_SEQ}" \
+            --out-json "${SMOKE_ROOT}/tol.json"
+        if [[ -f "${SMOKE_ROOT}/tol.json" ]]; then
+            DSA_TOL=$(python -c "
+import json; print(json.load(open('${SMOKE_ROOT}/tol.json'))['suggested_tol'])")
+            echo "标定得到 DSA_TOL=${DSA_TOL}"
+        fi
+    fi
 fi
 
 # ---- 1) capture：不截断，全 61 层 ----

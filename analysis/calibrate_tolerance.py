@@ -16,6 +16,7 @@ calibrate_tolerance.py — 标定全模型金丝雀的容差 DSA_TOL
 用法：
     python -m analysis.calibrate_tolerance RUN_TP8 RUN_TP4
     python -m analysis.calibrate_tolerance RUN_A RUN_B --layers 0,1,2,3,4
+    python -m analysis.calibrate_tolerance RUN_A RUN_B --out-json tol.json
 """
 
 import os
@@ -49,12 +50,30 @@ def rel_stats(a: np.ndarray, b: np.ndarray) -> dict:
             "exact_frac": float((a == b).mean())}
 
 
+# 容差上限：再往上就和 O(1) 的语义错误挨上了，金丝雀失去鉴别力。
+# 实测最坏值超过 TOL_CEILING/10 时应当怀疑不是 TP 噪声，而不是把阈值放宽。
+TOL_CEILING = 0.1
+
+
+def suggest_tol(overall: float) -> float:
+    """由实测最坏相对偏差给出金丝雀容差：10x 余量，且封顶。
+
+    不向上取整到 10 的整数次幂 —— 那会把 1.2e-3 抬到 1e-1（83x 余量），
+    把 3e-2 抬到 1.0，而语义错误正是 O(1)，阈值到了 1.0 就等于没检查。
+    """
+    if overall <= 0:
+        return 0.0
+    return min(overall * 10.0, TOL_CEILING)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run_a")
     ap.add_argument("run_b")
     ap.add_argument("--layers", default="0,1,2,3,4")
     ap.add_argument("--max-positions", type=int, default=8)
+    ap.add_argument("--out-json", default=None,
+                    help="把 worst/suggested_tol 落成 JSON，供脚本串联")
     args = ap.parse_args()
     layers = [int(x) for x in args.layers.split(",") if x]
 
@@ -107,17 +126,26 @@ def main():
                   f"{st['p50']:>11.3e} {st['exact_frac']:>10.4f}")
 
     overall = max(worst.values())
+    suggested = suggest_tol(overall)
+    if args.out_json:
+        json.dump({"run_a": args.run_a, "run_b": args.run_b,
+                   "layers": layers, "worst": worst, "overall": overall,
+                   "suggested_tol": suggested},
+                  open(args.out_json, "w"), indent=2)
     print(f"\nworst relative diff: "
           + ", ".join(f"{k}={v:.3e}" for k, v in worst.items()))
     if overall == 0:
         print("\n两个 run 逐位相同 —— 可以直接用 DSA_TOL=0（最严）。")
     else:
-        # 留一个数量级余量，但仍远低于语义错误的 O(1)
-        suggested = 10 ** np.ceil(np.log10(overall * 10))
-        print(f"\n建议 DSA_TOL={suggested:.0e}"
+        print(f"\n建议 DSA_TOL={suggested:.1e}"
               f"   （实测最坏 {overall:.3e}，留 10x 余量；"
               f"语义错误是 O(1)，仍有 {1/suggested:.0e}x 鉴别力）")
-        print(f"\n用法: DSA_TOL={suggested:.0e} DSA_REF_RUN=... DSA_NEW_RUN=... "
+        if overall * 10 > TOL_CEILING:
+            print(f"\n⚠ 实测偏差 {overall:.3e} 比 TP 求和顺序该有的量级"
+                  f"（bf16 尾数 ~1e-3）大得多，容差已封顶在 {TOL_CEILING:.0e}。"
+                  f"\n  正确反应是怀疑两个 run 不只差 TP（prompt/patch/层号/scale），"
+                  f"而不是继续放宽阈值。")
+        print(f"\n用法: DSA_TOL={suggested:.1e} DSA_REF_RUN=... DSA_NEW_RUN=... "
               f"pytest tests/test_full_model_consistency.py")
 
 
